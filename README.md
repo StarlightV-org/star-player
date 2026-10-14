@@ -38,12 +38,18 @@ Ship `target/release/spacer.exe`; no separate decoder files need to accompany it
 Launching without a file opens the clip library. On the first such launch,
 Spacer asks whether to detect NVIDIA Overlay recordings. Both acceptance and
 declining are saved in `%USERPROFILE%\.spacer\config.json`. Launching with a
-file skips the prompt. You can later use **Detect clips** or **Add folder**.
+file skips the prompt. The title-bar cog opens **Settings**, where you can
+add or remove library folders, toggle automatic NVIDIA folder discovery, or
+use **Detect now**. Disabling discovery leaves listed folders monitored.
+Removing a folder does not delete its files or watched history. Unavailable
+folders remain listed and resume scanning when their drives reconnect.
 
 Detection reads `%LOCALAPPDATA%\NVIDIA Corporation\NVIDIA Overlay\GallerySettings.json`
 and adds `settings.currentDirectoryV2` to the `clip_directories` array. Spacer
 does not change NVIDIA settings or move recordings. Missing settings or folders
 produce an error and leave manual folder selection available.
+Enabled discovery checks on startup and during periodic reconciliation.
+**Detect now** does not change the automatic-discovery preference.
 
 Game folders keep their hierarchy and show the latest clip's filesystem creation
 time and a recursive clip count. Folders without clips anywhere in their hierarchy
@@ -88,12 +94,23 @@ records remain readable and migrate as corresponding paths become known. Legacy
 rows remain available for offline folders. Older content-hash records cannot be
 matched without reading media contents and are retained without reinterpretation.
 Bulk **Mark watched** and **Mark unwatched** update the same history.
+Bulk controls share the sorting toolbar without shifting the clip list. Narrow
+windows use a selection-actions menu. Right-clicking a selected clip acts on the
+selection; right-clicking an unselected clip targets only that clip without
+changing selection. The context menu has icons for watched status, single-file
+rename, and destructive-colored Delete below a separator.
 
-Use **Rename** on a clip row or in the player to edit the filename stem while
-keeping its extension. Renaming transfers watched status and track settings to
+Use **Rename** in a clip's context menu or click the player's title-bar filename to edit
+the filename stem while keeping its extension. Renaming transfers watched
+status and track settings to
 the new hash, updates navigation and selection, and restores an open player's
 position and pause state. Existing destinations are never overwritten. A settings
 save failure attempts to roll back the rename and reports any incomplete recovery.
+The filename is centered in the title bar. Hovering over it reveals a pencil.
+The filename and Settings cog are interactive, not window-drag regions.
+In fullscreen, the editable
+title appears in a small top-center capsule alongside the auto-hiding controls.
+Press Enter in the rename field to save, or Escape to cancel.
 
 Bulk **Delete** and the Delete key ask for confirmation before moving clips to
 the Windows Recycle Bin. Failures are reported without permanently deleting files.
@@ -103,6 +120,16 @@ edit the same configuration/history simultaneously is not supported.
 
 The Windows title bar is drawn by GPUI Kit with the Spacer icon/name and window
 controls. It is hidden in fullscreen; native video occupies the space below it.
+The player's Library and Open file buttons are at the upper left. The info button
+shows a concise file summary, video codec/resolution/frame rate, audio/subtitle
+track details, chapters and useful tags. Decoder internals and duplicate fields
+are omitted. Errors use GPUI Kit notifications instead of inline banners or
+player error boxes. Repeated playback failures do not notify on every poll.
+The audio mixer and file-information panels close when clicking outside them.
+Their toggle buttons still open and close them, and clicks inside the panels
+do not dismiss them. An open mixer keeps the player controls visible.
+Keyboard shortcuts are listed in Settings
+and remain accessible with H or ?.
 
 Pinned build:
 

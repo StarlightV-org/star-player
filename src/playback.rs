@@ -105,6 +105,7 @@ pub struct Snapshot {
     pub dropped_frames: Option<f64>,
     pub decoder_dropped_frames: Option<f64>,
     pub tracks: Vec<AudioTrack>,
+    pub metadata: std::collections::BTreeMap<String, serde_json::Value>,
     /// Operation or fatal playback failure, not a decoder log message.
     pub error: Option<String>,
     /// Latest decoder/backend diagnostic for display in an information panel.
@@ -133,6 +134,7 @@ impl Default for Snapshot {
             dropped_frames: None,
             decoder_dropped_frames: None,
             tracks: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
             error: None,
             diagnostic: None,
             diagnostics: Vec::new(),
@@ -914,6 +916,28 @@ impl Player {
         Ok(value)
     }
 
+    fn refresh_metadata(&mut self) {
+        if self.preview {
+            return;
+        }
+        for property in [
+            "file-format",
+            "video-format",
+            "video-params",
+            "container-fps",
+            "video-bitrate",
+            "track-list",
+            "chapter-list",
+            "metadata",
+        ] {
+            if let Ok(value) = self.property_node(property) {
+                if !value.is_null() {
+                    self.state.metadata.insert(property.into(), value);
+                }
+            }
+        }
+    }
+
     fn tracks(&mut self) -> Result<(), String> {
         if self.preview {
             return Ok(());
@@ -973,6 +997,7 @@ impl Player {
                 self.set("lavfi-complex", "")?;
                 self.set("af", "")?;
                 self.state.tracks.clear();
+                self.state.metadata.clear();
                 self.saved_gains = saved
                     .as_ref()
                     .map(|state| state.gains.clone())
@@ -1209,6 +1234,7 @@ impl Player {
                     self.media_ready = false;
                     self.frame_ready = false;
                     self.state.tracks.clear();
+                    self.state.metadata.clear();
                     self.state.duration = 0.0;
                     self.state.position = 0.0;
                     self.mailbox.invalidate_frames();
@@ -1240,6 +1266,7 @@ impl Player {
                             self.state.error = Some(error);
                         }
                     }
+                    self.refresh_metadata();
                 }
                 20 => {
                     self.waiting_for_seek = false;
@@ -1250,11 +1277,15 @@ impl Player {
                     // Publish only after mpv completes startup/seek, not a redraw
                     // of the previous file or the pre-seek frame.
                     self.frame_ready = self.media_ready && !self.waiting_for_seek;
+                    if self.media_ready {
+                        self.refresh_metadata();
+                    }
                 }
                 22 if self.media_ready => {
                     if let Err(error) = self.tracks() {
                         self.state.error = Some(error);
                     }
+                    self.refresh_metadata();
                 }
                 25 if !event.data.is_null() => {
                     let hook = unsafe { &*event.data.cast::<Hook>() };
@@ -2737,6 +2768,22 @@ mod tests {
                 && p.state.tracks.len() == 2
                 && p.mailbox.frame.lock().unwrap().is_some()
         });
+        assert!(
+            player
+                .state
+                .metadata
+                .get("file-format")
+                .is_some_and(|value| value.is_string())
+        );
+        assert_eq!(player.state.metadata["video-params"]["w"], 64);
+        assert_eq!(player.state.metadata["video-params"]["h"], 48);
+        assert!(
+            player.state.metadata["track-list"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 3
+        );
         assert_eq!(
             player
                 .state
@@ -2859,6 +2906,10 @@ mod tests {
         );
 
         player.execute(Command::Load(blue)).unwrap();
+        assert!(
+            player.state.metadata.is_empty(),
+            "Metadata from the previous file leaked into loading"
+        );
         assert!(mailbox.frame.lock().unwrap().is_none());
         smoke_wait(&mut player, "same-size replacement video", |p| {
             p.mailbox.frame.lock().unwrap().is_some()

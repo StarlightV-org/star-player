@@ -6,6 +6,7 @@ use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
 
 pub enum SeekerEvent {
     Seek(f64),
+    PreviewError(String),
 }
 
 pub struct SeekerBar {
@@ -80,6 +81,9 @@ impl SeekerBar {
                     }
                     Err(error) => {
                         self.thumbnail = None;
+                        if self.preview_error.as_ref() != Some(&error) {
+                            cx.emit(SeekerEvent::PreviewError(error.clone()));
+                        }
                         self.preview_error = Some(error);
                     }
                 }
@@ -243,15 +247,18 @@ impl Render for SeekerBar {
                                             .object_fit(ObjectFit::Contain),
                                     )
                                 })
-                                .when(self.thumbnail.is_none(), |popup| {
-                                    popup.child(
-                                        div().h(px(80.0)).p_3().text_xs().child(
-                                            self.preview_error
-                                                .clone()
-                                                .unwrap_or_else(|| "Loading preview...".into()),
-                                        ),
-                                    )
-                                })
+                                .when(
+                                    self.thumbnail.is_none() && self.preview_error.is_none(),
+                                    |popup| {
+                                        popup.child(
+                                            div()
+                                                .h(px(80.0))
+                                                .p_3()
+                                                .text_xs()
+                                                .child("Loading preview..."),
+                                        )
+                                    },
+                                )
                                 .child(div().p_2().text_xs().child(timestamp(
                                     if self.thumbnail.is_some() {
                                         self.thumbnail_time

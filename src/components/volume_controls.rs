@@ -1,5 +1,5 @@
 use gpui_kit::component::{
-    ActiveTheme as _,
+    ActiveTheme as _, Icon,
     button::{Button, ButtonVariants},
     slider::{Slider, SliderEvent, SliderState},
 };
@@ -68,7 +68,7 @@ impl Render for VolumeControls {
             .child(
                 Button::new("mute")
                     .ghost()
-                    .label(if self.muted { "Muted" } else { "Sound" })
+                    .icon(Icon::new(volume_icon(self.muted, volume)))
                     .tooltip("Mute / unmute (M)")
                     .on_click(
                         cx.listener(|this, _, _, cx| cx.emit(VolumeEvent::Mute(!this.muted))),
@@ -82,5 +82,32 @@ impl Render for VolumeControls {
                     .text_color(cx.theme().muted_foreground)
                     .child(format!("{}%", if self.muted { 0 } else { volume as u32 })),
             )
+    }
+}
+
+fn volume_icon(muted: bool, volume: f32) -> gpui_kit::assets::IconName {
+    use gpui_kit::assets::IconName;
+    if muted {
+        IconName::VolumeX
+    } else if volume < 75.0 {
+        IconName::Volume1
+    } else {
+        IconName::Volume2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::volume_icon;
+    use gpui_kit::assets::IconName;
+
+    #[test]
+    fn volume_icons_respect_mute_and_the_75_percent_boundary() {
+        assert_eq!(volume_icon(true, 100.0), IconName::VolumeX);
+        assert_eq!(volume_icon(true, 0.0), IconName::VolumeX);
+        assert_eq!(volume_icon(false, 0.0), IconName::Volume1);
+        assert_eq!(volume_icon(false, 74.9), IconName::Volume1);
+        assert_eq!(volume_icon(false, 75.0), IconName::Volume2);
+        assert_eq!(volume_icon(false, 100.0), IconName::Volume2);
     }
 }

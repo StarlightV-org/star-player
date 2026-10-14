@@ -3,7 +3,10 @@ use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
-icon_assets!(SeekIcons, [RotateCcwClock]);
+icon_assets!(
+    SeekIcons,
+    [RotateCcwClock, Pencil, Trash, VolumeX, Volume1, Volume2]
+);
 
 pub struct AppAssets;
 
@@ -40,6 +43,15 @@ mod tests {
                 .is_some()
         );
         assert!(AppAssets.load("icons/play.svg").unwrap().is_some());
+        assert!(AppAssets.load("icons/pencil.svg").unwrap().is_some());
+        assert!(AppAssets.load("icons/trash.svg").unwrap().is_some());
+        for path in [
+            "icons/volume-x.svg",
+            "icons/volume-1.svg",
+            "icons/volume-2.svg",
+        ] {
+            assert!(AppAssets.load(path).unwrap().is_some());
+        }
         assert!(AppAssets.load("spacer/icon.png").unwrap().is_some());
         let paths = AppAssets.list("icons").unwrap();
         assert!(

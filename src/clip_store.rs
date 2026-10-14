@@ -47,6 +47,23 @@ pub fn directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "Cannot locate your home directory".into())
 }
 
+/// Hide Windows' extended-path syntax in UI only. Never use this for file I/O.
+pub fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        // Only strip drive paths; other extended namespaces must stay intact.
+        if rest.as_bytes().get(1) == Some(&b':') {
+            rest.to_owned()
+        } else {
+            text.into_owned()
+        }
+    } else {
+        text.into_owned()
+    }
+}
+
 pub fn read_config(dir: &Path) -> Result<Config, String> {
     let path = dir.join("config.json");
     match fs::read(&path) {
@@ -283,6 +300,23 @@ pub fn validate_gains(gains: &BTreeMap<i64, f64>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn display_paths_hide_extended_drive_and_unc_prefixes_only() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\F:\Clips\Gothic 1")),
+            r"F:\Clips\Gothic 1"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\Clips")),
+            r"\\server\share\Clips"
+        );
+        assert_eq!(display_path(Path::new(r"F:\Clips")), r"F:\Clips");
+        assert_eq!(
+            display_path(Path::new(r"\\?\Volume{abc}\Clips")),
+            r"\\?\Volume{abc}\Clips"
+        );
+    }
+
     #[test]
     fn legacy_records_remain_readable_and_use_folder_identity_on_save() {
         let dir = tempfile::tempdir().unwrap();

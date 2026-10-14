@@ -8,13 +8,14 @@ use components::{
     volume_controls::{VolumeControls, VolumeEvent},
 };
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, TitleBar,
+    ActiveTheme as _, Icon, IconName, TITLE_BAR_HEIGHT, TitleBar,
     button::{Button, ButtonVariants},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use playback::{Command, Playback, Snapshot};
 use std::{
+    cell::Cell,
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -26,11 +27,13 @@ mod app_icon;
 mod clip_library;
 mod clip_store;
 mod components;
+mod file_info;
 mod logging;
 mod media_keys;
 mod native_backdrop;
 mod native_video;
 mod navigation;
+mod notifications;
 mod playback;
 mod preview;
 mod runtime;
@@ -39,6 +42,32 @@ mod thumbnail_cache;
 #[cfg(all(test, windows))]
 mod todo_tests;
 mod window_cursor;
+
+const PLAYER_SHORTCUTS: &[(&str, &str)] = &[
+    ("Open media", "Ctrl+O"),
+    ("Play / pause", "Space / K"),
+    ("Play", "P"),
+    ("Pause", "Pause"),
+    ("Stop and rewind", "S"),
+    ("Seek 10 seconds", "Left / Right"),
+    ("Seek 60 seconds", "Shift+Left / Right"),
+    ("Start / end", "Home / End"),
+    ("Seek to 0 to 90%", "0 to 9"),
+    ("Previous / next frame", ", / ."),
+    ("Volume", "Up / Down"),
+    ("Mute", "M"),
+    ("Playback speed", "Shift+, / ."),
+    ("Reset speed", "R"),
+    ("Select audio track", "[ / ]"),
+    ("Track volume", "- / +"),
+    ("Toggle track", "A"),
+    ("Fullscreen", "F"),
+    ("Keyboard shortcuts", "H / ?"),
+    ("Reload theme", "Ctrl+Shift+T"),
+    ("Select all clips", "Ctrl+A"),
+    ("Delete selected clips", "Delete"),
+    ("Dismiss panels", "Esc"),
+];
 
 /// GPUI's texture upload expects BGRA, while our decoders produce RGBA.
 fn render_image(mut pixels: image::RgbaImage) -> Arc<RenderImage> {
@@ -79,6 +108,7 @@ struct PlayerShell {
     native_video: Option<Rc<native_video::NativeVideo>>,
     path: Option<PathBuf>,
     error: Option<String>,
+    notified_playback_error: Option<(Option<PathBuf>, String)>,
     focus: FocusHandle,
     media_controls: Entity<MediaControls>,
     volume_controls: Entity<VolumeControls>,
@@ -86,6 +116,10 @@ struct PlayerShell {
     audio_tracks: Entity<AudioTracks>,
     selected_track: usize,
     show_help: bool,
+    show_info: bool,
+    show_settings: bool,
+    title_hovered: bool,
+    title_focus: FocusHandle,
     show_tracks: bool,
     controls_visible: bool,
     controls_dragging: bool,
@@ -97,6 +131,151 @@ struct PlayerShell {
 }
 
 impl PlayerShell {
+    fn render_title_bar(&self, title: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        // The kit's content area excludes the window controls. Center against the
+        // whole bar instead, so the filename stays at the actual window midpoint.
+        div()
+            .relative()
+            .h(TITLE_BAR_HEIGHT)
+            .flex_shrink_0()
+            .child(
+                TitleBar::new().bg(cx.theme().background).child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(img("spacer/icon.png").w(px(20.)).h(px(20.)))
+                        .child("Spacer")
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
+                                .child(
+                                    Button::new("settings")
+                                        .ghost()
+                                        .icon(IconName::Settings)
+                                        .tooltip("Settings")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.set_settings(!this.show_settings, window, cx);
+                                        })),
+                                ),
+                        ),
+                ),
+            )
+            .when(self.path.is_some() && !self.show_settings, |bar| {
+                bar.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(relative(0.2))
+                        .right(relative(0.2))
+                        .h(TITLE_BAR_HEIGHT)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(self.render_media_title(title, false, cx)),
+                )
+            })
+    }
+
+    fn set_settings(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_settings = visible;
+        self.title_hovered = false;
+        self.browser.update(cx, |browser, cx| {
+            browser.settings = visible;
+            cx.notify();
+        });
+        if visible {
+            self.video_click.take();
+            self.hover_navigation = None;
+            if let Some(host) = &self.native_video {
+                host.hide();
+            }
+        } else if self.path.is_some() {
+            window.focus(&self.focus, cx);
+        } else {
+            self.browser
+                .update(cx, |browser, cx| browser.focus(window, cx));
+        }
+        self.reveal_controls(cx);
+        cx.notify();
+    }
+
+    fn rename_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.rename_busy
+            && let Some(path) = self.path.clone()
+        {
+            self.browser
+                .update(cx, |browser, cx| browser.prompt_rename(path, window, cx));
+        }
+    }
+
+    fn render_media_title(
+        &self,
+        title: &str,
+        fullscreen: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("editable-media-title")
+            // Exclude interactive content from the kit's native Windows drag hitbox.
+            .occlude()
+            .track_focus(&self.title_focus)
+            .tab_index(0)
+            .min_w_0()
+            .max_w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(fullscreen, |s| {
+                s.px_3()
+                    .py_2()
+                    .rounded_full()
+                    .bg(cx.theme().background.opacity(0.9))
+            })
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.title_focus, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.rename_current(window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.rename_current(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.title_hovered = *hovered;
+                this.reveal_controls(cx);
+                cx.notify();
+            }))
+            // Balance the pencil slot so the filename itself is centered.
+            .when(!fullscreen, |s| {
+                s.child(div().flex_shrink_0().w(px(16.)).h(px(16.)))
+            })
+            .child(div().min_w_0().truncate().text_sm().child(title.to_owned()))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(16.))
+                    .h(px(16.))
+                    .when(self.title_hovered, |s| {
+                        s.child(Icon::new(gpui_kit::assets::IconName::Pencil).size(px(16.)))
+                    }),
+            )
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let browser = cx.new(|cx| ClipBrowser::new(std::env::args_os().nth(1).is_none(), cx));
         Self::with_browser(browser, window, cx)
@@ -140,6 +319,7 @@ impl PlayerShell {
                         this.browser.read(cx).delete(paths.clone(), released);
                     }
                     BrowserEvent::Open => this.open(window, cx),
+                    BrowserEvent::CloseSettings => this.set_settings(false, window, cx),
                     BrowserEvent::Navigate(previous) => {
                         let mut view = this.current_view(cx);
                         view.browser = previous.clone();
@@ -208,12 +388,11 @@ impl PlayerShell {
                         {
                             this.scan_navigation(path, cx);
                         }
-                        this.error = Some(error.clone());
-                        crate::logging::Print(crate::logging::Level::Warn, error);
+                        notifications::error(window, cx, "Rename failed", error);
                         cx.notify();
                     }
                     BrowserEvent::Error(error) => {
-                        this.error = Some(error.clone());
+                        notifications::error(window, cx, "Library", error);
                         cx.notify();
                     }
                 },
@@ -249,9 +428,11 @@ impl PlayerShell {
             cx.subscribe_in(
                 &seeker_bar,
                 window,
-                |this, _, event: &SeekerEvent, _, cx| {
-                    let SeekerEvent::Seek(seconds) = event;
-                    this.command(Command::SeekAbsolute(*seconds), cx);
+                |this, _, event: &SeekerEvent, window, cx| match event {
+                    SeekerEvent::Seek(seconds) => this.command(Command::SeekAbsolute(*seconds), cx),
+                    SeekerEvent::PreviewError(error) => {
+                        notifications::error(window, cx, "Preview unavailable", error)
+                    }
                 },
             ),
             cx.subscribe_in(
@@ -323,6 +504,7 @@ impl PlayerShell {
             native_video,
             path: None,
             error,
+            notified_playback_error: None,
             focus,
             media_controls,
             volume_controls,
@@ -330,6 +512,10 @@ impl PlayerShell {
             audio_tracks,
             selected_track: 0,
             show_help: false,
+            show_info: false,
+            show_settings: false,
+            title_hovered: false,
+            title_focus: cx.focus_handle(),
             show_tracks: false,
             controls_visible: true,
             controls_dragging: false,
@@ -473,6 +659,7 @@ impl PlayerShell {
         self.initialize_audio(cx);
         self.pending_load = None;
         self.played_recorded = false;
+        self.title_hovered = false;
         self.hover_navigation = None;
         if self.playback.is_none() {
             let Some(host) = &self.native_video else {
@@ -490,6 +677,7 @@ impl PlayerShell {
         }
         self.error = None;
         self.snapshot = Snapshot::default();
+        self.notified_playback_error = None;
         self.selected_track = 0;
         self.show_tracks = false;
         self.path = Some(path.clone());
@@ -601,6 +789,20 @@ impl PlayerShell {
         if let Some(player) = &self.playback {
             self.snapshot = player.snapshot();
         }
+        if let Some(error) = self.error.take() {
+            notifications::error(window, cx, "Player", &error);
+        }
+        let playback_error = self
+            .snapshot
+            .error
+            .as_ref()
+            .map(|error| (self.snapshot.path.clone(), error.clone()));
+        if playback_error != self.notified_playback_error {
+            if let Some((_, error)) = &playback_error {
+                notifications::error(window, cx, "Playback failed", error);
+            }
+            self.notified_playback_error = playback_error;
+        }
         if !self.played_recorded
             && self.path.is_some()
             && self.snapshot.path == self.path
@@ -653,10 +855,15 @@ impl PlayerShell {
         }
         self.controls_visible = controls_should_show(
             self.path.is_none()
+                || self.show_settings
+                || self.show_info
+                || self.show_tracks
+                || self.show_help
+                || self.title_hovered
+                || self.title_focus.is_focused(window)
                 || self.rename_busy
                 || self.snapshot.paused
                 || self.hover_navigation.is_some()
-                || self.error.is_some()
                 || self.snapshot.error.is_some(),
             self.controls_dragging,
             self.last_activity.elapsed(),
@@ -668,6 +875,12 @@ impl PlayerShell {
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_settings {
+            if event.keystroke.key == "escape" {
+                self.set_settings(false, window, cx);
+            }
+            return;
+        }
         self.reveal_controls(cx);
         let key = event.keystroke.key.as_str();
         let modifiers = &event.keystroke.modifiers;
@@ -750,11 +963,13 @@ impl PlayerShell {
             }
             "escape" => {
                 self.show_help = false;
+                self.show_info = false;
                 self.show_tracks = false;
                 None
             }
             "h" | "?" => {
                 self.show_help = !self.show_help;
+                self.show_info = false;
                 None
             }
             digit if digit.len() == 1 && digit.as_bytes()[0].is_ascii_digit() => key
@@ -796,8 +1011,11 @@ impl PlayerShell {
         }
         self.path = None;
         self.snapshot = Snapshot::default();
+        self.notified_playback_error = None;
         self.hover_navigation = None;
         self.show_help = false;
+        self.show_info = false;
+        self.title_hovered = false;
         self.show_tracks = false;
         self.browser
             .update(cx, |browser, cx| browser.focus(window, cx));
@@ -819,7 +1037,9 @@ impl PlayerShell {
             size.width.into(),
             size.height.into(),
         )
-        .filter(|next| window.is_window_hovered() && self.adjacent(*next).is_some());
+        .filter(|next| {
+            !self.show_settings && window.is_window_hovered() && self.adjacent(*next).is_some()
+        });
         if self.hover_navigation != hovered {
             self.hover_navigation = hovered;
             cx.notify();
@@ -842,6 +1062,10 @@ impl PlayerShell {
     }
 
     fn navigate_history(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_settings {
+            self.set_settings(false, window, cx);
+            return;
+        }
         if self.rename_busy {
             return;
         }
@@ -874,6 +1098,8 @@ impl PlayerShell {
 
 impl Render for PlayerShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let info_trigger_bounds = Rc::new(Cell::new(Bounds::default()));
+        let mixer_trigger_bounds = Rc::new(Cell::new(Bounds::default()));
         let shell = cx.weak_entity();
         // History buttons work over occluding panels and the library as well as
         // the video. Root hitbox handlers alone cannot see all of those clicks.
@@ -899,7 +1125,6 @@ impl Render for PlayerShell {
         )
         .absolute()
         .size_full();
-        let error = self.error.clone().or_else(|| self.snapshot.error.clone());
         let title = self
             .path
             .as_ref()
@@ -934,7 +1159,9 @@ impl Render for PlayerShell {
                     .inset_0()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::click_video))
                     .when_some(
-                        self.native_video.clone().filter(|_| self.path.is_some()),
+                        self.native_video
+                            .clone()
+                            .filter(|_| self.path.is_some() && !self.show_settings),
                         |area, host| {
                             area.child(
                                 canvas(
@@ -948,7 +1175,7 @@ impl Render for PlayerShell {
                         },
                     ),
             )
-            .when(self.path.is_none(), |shell| {
+            .when(self.path.is_none() || self.show_settings, |shell| {
                 shell.child(
                     div()
                         .absolute()
@@ -958,204 +1185,21 @@ impl Render for PlayerShell {
                         .child(self.browser.clone()),
                 )
             })
-            .when(self.controls_visible && self.path.is_some(), |shell| {
-                shell
-                    .child(
-                        div()
-                            .absolute()
-                            .top_4()
-                            .left_4()
-                            .right_4()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .occlude()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(Self::click_overlay),
-                                    )
-                                    .min_w_0()
-                                    .max_w(relative(0.7))
-                                    .px_4()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .bg(cx.theme().background.opacity(0.85))
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .text_sm()
-                                    .truncate()
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .occlude()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(Self::click_overlay),
-                                    )
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .p_1()
-                                    .rounded_lg()
-                                    .bg(cx.theme().background.opacity(0.85))
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .child(
-                                        Button::new("back-library")
-                                            .ghost()
-                                            .icon(IconName::ChevronLeft)
-                                            .label("Library")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.back_to_library(window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("open-media")
-                                            .ghost()
-                                            .icon(IconName::FolderOpen)
-                                            .tooltip("Open media (Ctrl+O)")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.open(window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("help")
-                                            .ghost()
-                                            .icon(IconName::Info)
-                                            .tooltip("Keyboard shortcuts (H)")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.show_help = !this.show_help;
-                                                this.reveal_controls(cx);
-                                                cx.notify();
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("transport-panel")
-                            .occlude()
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
-                            .absolute()
-                            .bottom_4()
-                            .left_4()
-                            .right_4()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .px_4()
-                            .py_3()
-                            .rounded_xl()
-                            .bg(cx.theme().background.opacity(0.94))
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .shadow_lg()
-                            .child(self.seeker_bar.clone())
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_3()
-                                            .child(self.media_controls.clone())
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(format!("{:.2}×", self.snapshot.speed)),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(self.volume_controls.clone())
-                                            .child(
-                                                Button::new("rename-media")
-                                                    .ghost()
-                                                    .label("Rename")
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            if let Some(path) = this.path.clone() {
-                                                                this.browser.update(
-                                                                    cx,
-                                                                    |browser, cx| {
-                                                                        browser.prompt_rename(
-                                                                            path, window, cx,
-                                                                        )
-                                                                    },
-                                                                );
-                                                            }
-                                                        },
-                                                    )),
-                                            )
-                                            .when(!self.snapshot.tracks.is_empty(), |controls| {
-                                                controls.child(
-                                                    Button::new("audio-mixer")
-                                                        .ghost()
-                                                        .icon(IconName::Settings2)
-                                                        .tooltip("Audio track mixer")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.show_tracks = !this.show_tracks;
-                                                            this.reveal_controls(cx);
-                                                            cx.notify();
-                                                        })),
-                                                )
-                                            })
-                                            .child(
-                                                Button::new("fullscreen")
-                                                    .ghost()
-                                                    .icon(IconName::Maximize)
-                                                    .tooltip("Toggle fullscreen (F)")
-                                                    .on_click(cx.listener(|_, _, window, _| {
-                                                        window.toggle_fullscreen()
-                                                    })),
-                                            ),
-                                    ),
-                            ),
-                    )
-            })
-            .when(self.path.is_some() && self.controls_visible, |shell| {
-                let mut shell = shell;
-                for next in [false, true] {
-                    let Some(target) = self.adjacent(next) else {
-                        continue;
-                    };
-                    let hovered = self.hover_navigation == Some(next);
-                    let image = hovered
-                        .then(|| {
-                            self.browser
-                                .update(cx, |browser, _| browser.thumbnail(&target))
-                        })
-                        .flatten();
-                    shell = shell.child(
-                        div()
-                            .id(if next { "next-video" } else { "previous-video" })
-                            .absolute()
-                            .top(relative(0.5))
-                            .mt(px(-120.0))
-                            .w(px(220.0))
-                            .h(px(240.0))
-                            .when(next, |s| s.right_4())
-                            .when(!next, |s| s.left_4())
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .when(next, |s| s.items_end())
-                            .when(!next, |s| s.items_start())
-                            .gap_2()
-                            .when(hovered, |s| {
-                                s.child(
+            .when(
+                self.controls_visible && self.path.is_some() && !self.show_settings,
+                |shell| {
+                    shell
+                        .child(
+                            div()
+                                .absolute()
+                                .top_4()
+                                .left_4()
+                                .right_4()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_4()
+                                .child(
                                     div()
                                         .occlude()
                                         .on_mouse_down(
@@ -1163,205 +1207,430 @@ impl Render for PlayerShell {
                                             cx.listener(Self::click_overlay),
                                         )
                                         .flex()
-                                        .flex_col()
-                                        .gap_2()
+                                        .items_center()
+                                        .gap_1()
+                                        .p_1()
+                                        .rounded_lg()
+                                        .bg(cx.theme().background.opacity(0.85))
+                                        .border_1()
+                                        .border_color(cx.theme().border)
                                         .child(
-                                            Button::new(if next {
-                                                "next-clip"
-                                            } else {
-                                                "previous-clip"
-                                            })
-                                            .ghost()
-                                            .icon(if next {
-                                                IconName::ChevronRight
-                                            } else {
-                                                IconName::ChevronLeft
-                                            })
-                                            .label(if next { "Next" } else { "Previous" })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if let Some(path) = this.adjacent(next) {
-                                                    this.load(path, cx);
-                                                }
-                                            })),
+                                            Button::new("back-library")
+                                                .ghost()
+                                                .icon(IconName::ChevronLeft)
+                                                .label("Library")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.back_to_library(window, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("open-media")
+                                                .ghost()
+                                                .icon(IconName::FolderOpen)
+                                                .tooltip("Open media (Ctrl+O)")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.open(window, cx)
+                                                })),
+                                        ),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .relative()
+                                        .occlude()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(Self::click_overlay),
+                                        )
+                                        .child(
+                                            Button::new("file-info")
+                                                .ghost()
+                                                .icon(IconName::Info)
+                                                .tooltip("File information")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.show_info = !this.show_info;
+                                                    cx.stop_propagation();
+                                                    this.video_click.take();
+                                                    this.show_help = false;
+                                                    this.reveal_controls(cx);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(measure_bounds(info_trigger_bounds.clone())),
+                                )
+                                .when(window.is_fullscreen(), |s| {
+                                    s.child(
+                                        div()
+                                            .occlude()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(Self::click_overlay),
+                                            )
+                                            .child(
+                                                Button::new("fullscreen-settings")
+                                                    .ghost()
+                                                    .icon(IconName::Settings)
+                                                    .tooltip("Settings")
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.set_settings(true, window, cx)
+                                                        },
+                                                    )),
+                                            ),
+                                    )
+                                }),
+                        )
+                        .when(window.is_fullscreen(), |s| {
+                            s.child(
+                                div()
+                                    .absolute()
+                                    .top_4()
+                                    .left(relative(0.25))
+                                    .right(relative(0.25))
+                                    .flex()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .max_w_full()
+                                            .child(self.render_media_title(&title, true, cx)),
+                                    ),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("transport-panel")
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
+                                .absolute()
+                                .bottom_4()
+                                .left_4()
+                                .right_4()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .px_4()
+                                .py_3()
+                                .rounded_xl()
+                                .bg(cx.theme().background.opacity(0.94))
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .shadow_lg()
+                                .child(self.seeker_bar.clone())
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_3()
+                                                .child(self.media_controls.clone())
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(format!(
+                                                            "{:.2}×",
+                                                            self.snapshot.speed
+                                                        )),
+                                                ),
                                         )
                                         .child(
                                             div()
-                                                .w(px(180.))
-                                                .p_2()
-                                                .rounded_md()
-                                                .bg(cx.theme().popover)
-                                                .when_some(image, |s, image| {
-                                                    s.child(
-                                                        img(image)
-                                                            .w_full()
-                                                            .h(px(101.))
-                                                            .object_fit(ObjectFit::Contain),
-                                                    )
-                                                })
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(self.volume_controls.clone())
+                                                .when(
+                                                    !self.snapshot.tracks.is_empty(),
+                                                    |controls| {
+                                                        controls.child(
+                                                            div().relative().child(Button::new("audio-mixer")
+                                                                .ghost()
+                                                                .icon(IconName::Settings2)
+                                                                .tooltip("Audio track mixer")
+                                                                .on_click(cx.listener(
+                                                                    |this, _, _, cx| {
+                                                                        this.show_tracks =
+                                                                            !this.show_tracks;
+                                                                        this.reveal_controls(cx);
+                                                                        cx.notify();
+                                                                    },
+                                                                )))
+                                                                .child(measure_bounds(mixer_trigger_bounds.clone())),
+                                                        )
+                                                    },
+                                                )
                                                 .child(
-                                                    div().text_xs().truncate().child(
-                                                        target
-                                                            .file_name()
-                                                            .unwrap_or_default()
-                                                            .to_string_lossy()
-                                                            .into_owned(),
-                                                    ),
+                                                    Button::new("fullscreen")
+                                                        .ghost()
+                                                        .icon(IconName::Maximize)
+                                                        .tooltip("Toggle fullscreen (F)")
+                                                        .on_click(cx.listener(
+                                                            |_, _, window, _| {
+                                                                window.toggle_fullscreen()
+                                                            },
+                                                        )),
                                                 ),
                                         ),
-                                )
-                            }),
-                    );
-                }
-                shell
-            })
-            .when(self.controls_visible && self.show_tracks, |shell| {
-                shell.child(
-                    div()
-                        .absolute()
-                        .bottom(px(128.0))
-                        .right_4()
-                        .w(px(380.0))
-                        .occlude()
-                        .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
-                        .p_4()
-                        .rounded_xl()
-                        .bg(cx.theme().popover.opacity(0.96))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .shadow_lg()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .mb_3()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("Audio mixer"),
-                                )
-                                .child(
-                                    Button::new("close-mixer")
-                                        .ghost()
-                                        .icon(IconName::Close)
-                                        .tooltip("Close mixer")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.show_tracks = false;
-                                            cx.notify();
-                                        })),
                                 ),
                         )
-                        .child(self.audio_tracks.clone()),
-                )
-            })
-            .when(self.controls_visible && self.show_help, |shell| {
-                shell.child(
-                    div()
-                        .absolute()
-                        .top(px(76.0))
-                        .right_4()
-                        .w(px(360.0))
-                        .occlude()
-                        .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
-                        .p_4()
-                        .rounded_xl()
-                        .bg(cx.theme().popover.opacity(0.96))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .shadow_lg()
-                        .child(
+                },
+            )
+            .when(
+                self.path.is_some() && self.controls_visible && !self.show_settings,
+                |shell| {
+                    let mut shell = shell;
+                    for next in [false, true] {
+                        let Some(target) = self.adjacent(next) else {
+                            continue;
+                        };
+                        let hovered = self.hover_navigation == Some(next);
+                        let image = hovered
+                            .then(|| {
+                                self.browser
+                                    .update(cx, |browser, _| browser.thumbnail(&target))
+                            })
+                            .flatten();
+                        shell = shell.child(
                             div()
+                                .id(if next { "next-video" } else { "previous-video" })
+                                .absolute()
+                                .top(relative(0.5))
+                                .mt(px(-120.0))
+                                .w(px(220.0))
+                                .h(px(240.0))
+                                .when(next, |s| s.right_4())
+                                .when(!next, |s| s.left_4())
                                 .flex()
-                                .items_center()
-                                .justify_between()
-                                .mb_3()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("Keyboard shortcuts"),
-                                )
-                                .child(
-                                    Button::new("close-help")
-                                        .ghost()
-                                        .icon(IconName::Close)
-                                        .tooltip("Close shortcuts")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.show_help = false;
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .children(
-                            [
-                                ("Open media", "Ctrl+O"),
-                                ("Play / pause", "Space / K"),
-                                ("Seek 10 seconds", "← / →"),
-                                ("Seek 60 seconds", "Shift + ← / →"),
-                                ("Previous / next frame", ", / ."),
-                                ("Volume", "↑ / ↓"),
-                                ("Mute", "M"),
-                                ("Playback speed", "Shift + , / ."),
-                                ("Select audio track", "[ / ]"),
-                                ("Track volume", "− / +"),
-                                ("Fullscreen", "F"),
-                                ("Reload theme", "Ctrl+Shift+T"),
-                                ("Dismiss panels", "Esc"),
-                            ]
-                            .into_iter()
-                            .map(|(action, shortcut)| {
+                                .flex_col()
+                                .justify_center()
+                                .when(next, |s| s.items_end())
+                                .when(!next, |s| s.items_start())
+                                .gap_2()
+                                .when(hovered, |s| {
+                                    s.child(
+                                        div()
+                                            .occlude()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(Self::click_overlay),
+                                            )
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                Button::new(if next {
+                                                    "next-clip"
+                                                } else {
+                                                    "previous-clip"
+                                                })
+                                                .ghost()
+                                                .icon(if next {
+                                                    IconName::ChevronRight
+                                                } else {
+                                                    IconName::ChevronLeft
+                                                })
+                                                .label(if next { "Next" } else { "Previous" })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if let Some(path) = this.adjacent(next) {
+                                                        this.load(path, cx);
+                                                    }
+                                                })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(180.))
+                                                    .p_2()
+                                                    .rounded_md()
+                                                    .bg(cx.theme().popover)
+                                                    .when_some(image, |s, image| {
+                                                        s.child(
+                                                            img(image)
+                                                                .w_full()
+                                                                .h(px(101.))
+                                                                .object_fit(ObjectFit::Contain),
+                                                        )
+                                                    })
+                                                    .child(
+                                                        div().text_xs().truncate().child(
+                                                            target
+                                                                .file_name()
+                                                                .unwrap_or_default()
+                                                                .to_string_lossy()
+                                                                .into_owned(),
+                                                        ),
+                                                    ),
+                                            ),
+                                    )
+                                }),
+                        );
+                    }
+                    shell
+                },
+            )
+            .when(
+                self.controls_visible && self.show_tracks && !self.show_settings,
+                |shell| {
+                    let trigger_bounds = mixer_trigger_bounds.clone();
+                    shell.child(
+                        div()
+                            .id("audio-mixer-panel")
+                            .absolute()
+                            .bottom(px(128.0))
+                            .right_4()
+                            .w(px(380.0))
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
+                            .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                if !trigger_bounds.get().contains(&event.position) {
+                                    this.show_tracks = false;
+                                    cx.notify();
+                                }
+                            }))
+                            .p_4()
+                            .rounded_xl()
+                            .bg(cx.theme().popover.opacity(0.96))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .shadow_lg()
+                            .child(
                                 div()
                                     .flex()
+                                    .items_center()
                                     .justify_between()
-                                    .py_1()
-                                    .gap_4()
-                                    .text_xs()
+                                    .mb_3()
                                     .child(
-                                        div().text_color(cx.theme().muted_foreground).child(action),
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Audio mixer"),
                                     )
-                                    .child(shortcut)
-                            }),
-                        ),
-                )
-            })
-            .when_some(error, |shell, error| {
-                shell.child(
-                    div()
-                        .absolute()
-                        .top(px(76.0))
-                        .left_4()
-                        .max_w(px(480.0))
-                        .occlude()
+                                    .child(
+                                        Button::new("close-mixer")
+                                            .ghost()
+                                            .icon(IconName::Close)
+                                            .tooltip("Close mixer")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_tracks = false;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(self.audio_tracks.clone()),
+                    )
+                },
+            )
+            .when(
+                self.controls_visible && self.show_info && !self.show_settings,
+                |shell| {
+                    let trigger_bounds = info_trigger_bounds.clone();
+                    shell.child(
+                        file_info::panel(
+                            &self.snapshot,
+                            self.path.as_deref(),
+                            cx,
+                            Button::new("close-file-info")
+                                .ghost()
+                                .icon(IconName::Close)
+                                .tooltip("Close file information")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_info = false;
+                                    cx.notify();
+                                })),
+                        )
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
-                        .p_4()
-                        .rounded_lg()
-                        .bg(cx.theme().background.opacity(0.96))
-                        .border_1()
-                        .border_color(cx.theme().danger.opacity(0.4))
-                        .text_sm()
-                        .child(error),
-                )
-            });
+                        .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            if !trigger_bounds.get().contains(&event.position) {
+                                this.show_info = false;
+                                cx.notify();
+                            }
+                        })),
+                    )
+                },
+            )
+            .when(
+                self.controls_visible && self.show_help && !self.show_settings,
+                |shell| {
+                    shell.child(
+                        div()
+                            .absolute()
+                            .top(px(76.0))
+                            .right_4()
+                            .w(px(360.0))
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
+                            .p_4()
+                            .rounded_xl()
+                            .bg(cx.theme().popover.opacity(0.96))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .shadow_lg()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .mb_3()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Keyboard shortcuts"),
+                                    )
+                                    .child(
+                                        Button::new("close-help")
+                                            .ghost()
+                                            .icon(IconName::Close)
+                                            .tooltip("Close shortcuts")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_help = false;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .children(PLAYER_SHORTCUTS.iter().copied().map(
+                                |(action, shortcut)| {
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .py_1()
+                                        .gap_4()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(action),
+                                        )
+                                        .child(shortcut)
+                                },
+                            )),
+                    )
+                },
+            );
         div()
             .size_full()
             .flex()
             .flex_col()
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| this.reveal_controls(cx)))
             .when(!window.is_fullscreen(), |shell| {
-                shell.child(
-                    TitleBar::new().bg(cx.theme().background).child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(img("spacer/icon.png").w(px(20.)).h(px(20.)))
-                            .child("Spacer"),
-                    ),
-                )
+                shell.child(self.render_title_bar(&title, cx))
             })
             .child(div().relative().flex_1().min_h_0().child(content))
     }
+}
+
+// Measure the toggle buttons separately so outside-click dismissal cannot
+// close a panel on mouse-down and accidentally reopen it on the button's click.
+fn measure_bounds(bounds: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
+    canvas(move |layout, _, _| bounds.set(layout), |_, _, _, _| {})
+        .absolute()
+        .inset_0()
+        .size_full()
 }
 
 fn controls_should_show(persistent: bool, interacting: bool, idle: Duration) -> bool {

@@ -135,6 +135,8 @@ pub fn scan(roots: &[PathBuf]) -> (Catalog, Vec<String>) {
 pub enum Request {
     Consent(bool),
     AddFolder(PathBuf),
+    RemoveFolder(PathBuf),
+    Detect,
     Sort(String),
     Refresh,
     Thumbnail(PathBuf, Stamp),
@@ -233,6 +235,19 @@ fn run(
         let _ = events.send(Event::Error(e));
         History::new()
     });
+    if config_valid && config.clip_discovery == clip_store::Discovery::Enabled {
+        let mut next = config.clone();
+        if clip_store::detect_nvidia(&mut next).is_ok()
+            && next.clip_directories != config.clip_directories
+        {
+            match clip_store::save_config(dir, &next) {
+                Ok(()) => config = next,
+                Err(error) => {
+                    let _ = events.send(Event::Error(error));
+                }
+            }
+        }
+    }
     let _ = events.send(Event::Config(config.clone()));
     let _ = events.send(Event::History(history.clone()));
     let (watch_tx, watch_rx) = mpsc::channel();
@@ -398,11 +413,19 @@ fn run(
                         let _ = events.send(Event::Error(e));
                     }
                 }
-                Request::AddFolder(path) => {
+                Request::AddFolder(_) | Request::RemoveFolder(_) | Request::Detect => {
                     let mut next = config.clone();
                     let result = if config_valid {
-                        clip_store::add_directory(&mut next, path)
-                            .and_then(|_| clip_store::save_config(dir, &next))
+                        match request {
+                            Request::AddFolder(path) => clip_store::add_directory(&mut next, path),
+                            Request::RemoveFolder(path) => {
+                                next.clip_directories.retain(|root| root != &path);
+                                Ok(())
+                            }
+                            Request::Detect => clip_store::detect_nvidia(&mut next),
+                            _ => unreachable!(),
+                        }
+                        .and_then(|_| clip_store::save_config(dir, &next))
                     } else {
                         Err("Repair config.json before saving preferences".into())
                     };
@@ -489,11 +512,27 @@ fn run(
         }
         // Periodic reconciliation also recovers missing/reconnected roots and missed events.
         if last_scan.elapsed() >= Duration::from_secs(30) {
+            if config_valid && config.clip_discovery == clip_store::Discovery::Enabled {
+                let mut next = config.clone();
+                if clip_store::detect_nvidia(&mut next).is_ok()
+                    && next.clip_directories != config.clip_directories
+                {
+                    match clip_store::save_config(dir, &next) {
+                        Ok(()) => {
+                            config = next;
+                            let _ = events.send(Event::Config(config.clone()));
+                        }
+                        Err(error) => {
+                            let _ = events.send(Event::Error(error));
+                        }
+                    }
+                }
+            }
             dirty.get_or_insert(Instant::now() - Duration::from_secs(1));
         }
         if dirty.is_some_and(|at| at.elapsed() >= Duration::from_millis(400)) {
             watched_roots.retain(|p: &PathBuf| {
-                if p.is_dir() {
+                if p.is_dir() && config.clip_directories.contains(p) {
                     true
                 } else {
                     if let Some(watcher) = &mut watcher {
@@ -781,6 +820,42 @@ fn rename_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_disable_discovery_and_remove_roots_without_deleting_files() {
+        let store = tempfile::tempdir().unwrap();
+        let clips = tempfile::tempdir().unwrap();
+        let video = clips.path().join("clip.mp4");
+        fs::write(&video, b"keep this file").unwrap();
+        let mut config = Config::default();
+        clip_store::add_directory(&mut config, clips.path().to_owned()).unwrap();
+        clip_store::save_config(store.path(), &config).unwrap();
+        let worker = LibraryWorker::for_test(store.path().to_owned());
+        let wait_config = |predicate: &dyn Fn(&Config) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                for event in worker.events() {
+                    match event {
+                        Event::Config(config) if predicate(&config) => return config,
+                        Event::Error(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+                assert!(Instant::now() < deadline, "Settings update timed out");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        worker.send(Request::Consent(false));
+        let disabled =
+            wait_config(&|config| config.clip_discovery == clip_store::Discovery::Declined);
+        assert_eq!(disabled.clip_directories, config.clip_directories);
+        worker.send(Request::RemoveFolder(config.clip_directories[0].clone()));
+        wait_config(&|config| config.clip_directories.is_empty());
+        assert_eq!(fs::read(video).unwrap(), b"keep this file");
+        let saved = clip_store::read_config(store.path()).unwrap();
+        assert_eq!(saved.clip_discovery, clip_store::Discovery::Declined);
+        assert!(saved.clip_directories.is_empty());
+    }
+
     #[test]
     fn rename_preserves_settings_and_refuses_existing_files() {
         let dir = tempfile::tempdir().unwrap();

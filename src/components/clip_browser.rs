@@ -8,7 +8,8 @@ use gpui_kit::{
         ActiveTheme as _, Icon, IconName, WindowExt,
         button::{Button, ButtonVariants},
         checkbox::Checkbox,
-        input::{Input, InputState},
+        input::{Input, InputEvent, InputState},
+        menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
     },
     prelude::FluentBuilder as _,
     *,
@@ -25,6 +26,7 @@ pub enum BrowserEvent {
     Play(PathBuf, Vec<PathBuf>),
     Delete(Vec<PathBuf>),
     Open,
+    CloseSettings,
     Navigate(BrowserView),
     Rename(PathBuf, String),
     Renamed(PathBuf, PathBuf),
@@ -74,7 +76,8 @@ pub struct ClipBrowser {
     config_ready: bool,
     history_ready: bool,
     audio_overrides: HashMap<String, std::collections::BTreeMap<i64, f64>>,
-    error: Option<String>,
+    pub settings: bool,
+    rename_subscription: Option<Subscription>,
 }
 impl EventEmitter<BrowserEvent> for ClipBrowser {}
 
@@ -123,7 +126,8 @@ impl ClipBrowser {
             config_ready: false,
             history_ready: false,
             audio_overrides: HashMap::new(),
-            error: None,
+            settings: false,
+            rename_subscription: None,
         }
     }
 
@@ -133,6 +137,18 @@ impl ClipBrowser {
             match event {
                 Event::Config(config) => {
                     self.config = config;
+                    if self.folder.as_ref().is_some_and(|folder| {
+                        !self
+                            .config
+                            .clip_directories
+                            .iter()
+                            .any(|root| folder.starts_with(root))
+                    }) {
+                        self.folder = None;
+                        self.selected.clear();
+                        self.anchor = None;
+                        self.scroll.set_offset(Point::default());
+                    }
                     self.config_ready = true;
                     self.rebuild();
                 }
@@ -217,9 +233,7 @@ impl ClipBrowser {
                     }
                 }
                 Event::Error(error) => {
-                    crate::logging::Print(crate::logging::Level::Warn, &error);
-                    cx.emit(BrowserEvent::Error(error.clone()));
-                    self.error = Some(error);
+                    cx.emit(BrowserEvent::Error(error));
                 }
             }
             cx.notify();
@@ -392,15 +406,38 @@ impl ClipBrowser {
     ) {
         self.worker.send(Request::Rename(path, stem, released));
     }
-    pub fn prompt_rename(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn prompt_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let stem = path
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(stem));
+        let enter_path = path.clone();
+        self.rename_subscription = Some(cx.subscribe_in(
+            &input,
+            window,
+            move |_, input, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let stem = input.read(cx).value().to_string();
+                    match crate::clip_library::rename_destination(&enter_path, &stem) {
+                        Ok(_) => {
+                            cx.emit(BrowserEvent::Rename(enter_path.clone(), stem));
+                            window.close_dialog(cx);
+                        }
+                        Err(error) => {
+                            crate::notifications::error(window, cx, "Cannot rename file", &error)
+                        }
+                    }
+                }
+            },
+        ));
         let owner = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        let initial_focus = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if initial_focus.replace(false) {
+                input.focus_handle(cx).focus(window, cx);
+            }
             let input = input.clone();
             let owner = owner.clone();
             let path = path.clone();
@@ -429,7 +466,12 @@ impl ClipBrowser {
                                             window.close_dialog(cx);
                                         }
                                         Err(error) => {
-                                            window.push_notification(error, cx);
+                                            crate::notifications::error(
+                                                window,
+                                                cx,
+                                                "Cannot rename file",
+                                                &error,
+                                            );
                                         }
                                     }
                                 }),
@@ -448,6 +490,9 @@ impl ClipBrowser {
     }
     fn mark_selection(&mut self, watched: bool, cx: &mut Context<Self>) {
         let paths = self.selected.iter().cloned().collect::<Vec<_>>();
+        self.mark_paths(paths, watched, cx);
+    }
+    fn mark_paths(&mut self, paths: Vec<PathBuf>, watched: bool, cx: &mut Context<Self>) {
         for path in &paths {
             self.pending_watched.insert(path.clone(), watched);
         }
@@ -534,10 +579,17 @@ impl ClipBrowser {
         cx.emit(BrowserEvent::Play(path, list));
     }
     fn confirm_delete(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected.is_empty() {
+        self.confirm_delete_paths(self.selected.iter().cloned().collect(), window, cx);
+    }
+    fn confirm_delete_paths(
+        &self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
             return;
         }
-        let paths = self.selected.iter().cloned().collect::<Vec<_>>();
         let owner = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let paths = paths.clone();
@@ -545,7 +597,7 @@ impl ClipBrowser {
             alert
                 .title("Move clips to Recycle Bin?")
                 .description(format!(
-                    "{} selected clips will be moved to the Windows Recycle Bin.",
+                    "{} clips will be moved to the Windows Recycle Bin.",
                     paths.len()
                 ))
                 .confirm()
@@ -564,14 +616,25 @@ impl ClipBrowser {
             multiple: false,
             prompt: Some("Add clip directory".into()),
         });
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = selection.await {
+        cx.spawn_in(window, async move |this, cx| match selection.await {
+            Ok(Ok(Some(paths))) => {
                 let _ = this.update_in(cx, |this, _, _| {
                     for path in paths {
                         this.worker.send(Request::AddFolder(path));
                     }
                 });
             }
+            Ok(Err(error)) => {
+                let _ = this.update_in(cx, |_, window, cx| {
+                    crate::notifications::error(
+                        window,
+                        cx,
+                        "Cannot select folder",
+                        &error.to_string(),
+                    );
+                });
+            }
+            _ => {}
         })
         .detach();
     }
@@ -631,7 +694,8 @@ impl ClipBrowser {
                     .and_then(|(_, image)| image.clone());
                 let check_path = path.clone();
                 let play_path = path.clone();
-                let rename_path = path.clone();
+                let menu_path = path.clone();
+                let owner = cx.entity();
                 div()
                     .id(SharedString::from(format!("clip:{}", path.display())))
                     .w_full()
@@ -704,18 +768,6 @@ impl ClipBrowser {
                         )
                     })
                     .child(
-                        div()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(
-                                Button::new(("rename-clip", index))
-                                    .ghost()
-                                    .label("Rename")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.prompt_rename(rename_path.clone(), window, cx)
-                                    })),
-                            ),
-                    )
-                    .child(
                         Button::new(("play-clip", index))
                             .ghost()
                             .icon(IconName::Play)
@@ -736,6 +788,69 @@ impl ClipBrowser {
                             cx.stop_propagation();
                         }),
                     )
+                    .context_menu(move |menu, window, cx| {
+                        let mut targets = vec![menu_path.clone()];
+                        let mut has_watched = false;
+                        let mut has_unwatched = false;
+                        let _ = owner.update(cx, |this, cx| {
+                            targets = context_targets(&this.selected, &menu_path);
+                            for path in &targets {
+                                let watched =
+                                    this.pending_watched.get(path).copied().unwrap_or_else(|| {
+                                        !this.media_state(path).watched_at.is_empty()
+                                    });
+                                has_watched |= watched;
+                                has_unwatched |= !watched;
+                            }
+                            window.focus(&this.focus, cx);
+                        });
+                        let single = targets.len() == 1;
+                        let watched_paths = targets.clone();
+                        let unwatched_paths = targets.clone();
+                        let watched_owner = owner.clone();
+                        let unwatched_owner = owner.clone();
+                        let rename_owner = owner.clone();
+                        let delete_owner = owner.clone();
+                        let rename_path = menu_path.clone();
+                        menu.when(has_unwatched, |menu| {
+                            menu.item(
+                                PopupMenuItem::new("Mark watched")
+                                    .icon(IconName::Eye)
+                                    .on_click(move |_, _, cx| {
+                                        watched_owner.update(cx, |this, cx| {
+                                            this.mark_paths(watched_paths.clone(), true, cx)
+                                        });
+                                    }),
+                            )
+                        })
+                        .when(has_watched, |menu| {
+                            menu.item(
+                                PopupMenuItem::new("Mark unwatched")
+                                    .icon(IconName::EyeOff)
+                                    .on_click(move |_, _, cx| {
+                                        unwatched_owner.update(cx, |this, cx| {
+                                            this.mark_paths(unwatched_paths.clone(), false, cx)
+                                        });
+                                    }),
+                            )
+                        })
+                        .item(
+                            PopupMenuItem::new("Rename")
+                                .icon(Icon::new(gpui_kit::assets::IconName::Pencil))
+                                .disabled(!single)
+                                .on_click(move |_, window, cx| {
+                                    rename_owner.update(cx, |this, cx| {
+                                        this.prompt_rename(rename_path.clone(), window, cx)
+                                    });
+                                }),
+                        )
+                        .separator()
+                        .item(delete_menu_item(cx).on_click(move |_, window, cx| {
+                            delete_owner.update(cx, |this, cx| {
+                                this.confirm_delete_paths(targets.clone(), window, cx)
+                            });
+                        }))
+                    })
                     .into_any_element()
             }
         }
@@ -743,7 +858,12 @@ impl ClipBrowser {
 }
 
 impl Render for ClipBrowser {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.settings {
+            return self.render_settings(cx).into_any_element();
+        }
+        let compact = window.viewport_size().width < px(1000.);
+        let menu_owner = cx.entity();
         let folder = self.folder.clone();
         let parent = folder.as_ref().and_then(|p| {
             if self.config.clip_directories.contains(p)
@@ -810,24 +930,9 @@ impl Render for ClipBrowser {
                         div().flex_1().min_w_0().truncate().child(
                             folder
                                 .as_ref()
-                                .map(|p| p.display().to_string())
+                                .map(|p| crate::clip_store::display_path(p))
                                 .unwrap_or_else(|| "Game clips".into()),
                         ),
-                    )
-                    .child(
-                        Button::new("detect-clips")
-                            .ghost()
-                            .label("Detect clips")
-                            .on_click(cx.listener(|this, _, window, cx| this.prompt(window, cx))),
-                    )
-                    .child(
-                        Button::new("add-clips")
-                            .ghost()
-                            .icon(IconName::FolderOpen)
-                            .label("Add folder")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.add_folder(window, cx)),
-                            ),
                     )
                     .child(
                         Button::new("open-file")
@@ -842,7 +947,8 @@ impl Render for ClipBrowser {
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .py_2()
+                    .h(px(48.))
+                    .flex_shrink_0()
                     .child(div().text_xs().child("Sort folders"))
                     .children(
                         [
@@ -869,67 +975,85 @@ impl Render for ClipBrowser {
                                 this.requested.clear();
                                 this.worker.send(Request::Refresh);
                             })),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .when(count > 0 && !compact, |s| {
+                        s.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(format!("{count} selected"))
+                                .child(
+                                    Button::new("mark-watched")
+                                        .ghost()
+                                        .label("Mark watched")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.mark_selection(true, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("mark-unwatched")
+                                        .ghost()
+                                        .label("Mark unwatched")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.mark_selection(false, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("delete-clips")
+                                        .danger()
+                                        .label("Delete")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.confirm_delete(window, cx)
+                                        })),
+                                ),
+                        )
+                    })
+                    .when(count > 0 && compact, |s| {
+                        s.child(
+                            Button::new("bulk-actions")
+                                .ghost()
+                                .label(format!("{count} selected"))
+                                .icon(IconName::ChevronDown)
+                                .dropdown_menu(move |menu, _, cx| {
+                                    let watched = menu_owner.clone();
+                                    let unwatched = menu_owner.clone();
+                                    let delete = menu_owner.clone();
+                                    menu.item(
+                                        PopupMenuItem::new("Mark watched")
+                                            .icon(IconName::Eye)
+                                            .on_click(move |_, _, cx| {
+                                                watched.update(cx, |this, cx| {
+                                                    this.mark_selection(true, cx)
+                                                });
+                                            }),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new("Mark unwatched")
+                                            .icon(IconName::EyeOff)
+                                            .on_click(move |_, _, cx| {
+                                                unwatched.update(cx, |this, cx| {
+                                                    this.mark_selection(false, cx)
+                                                });
+                                            }),
+                                    )
+                                    .separator()
+                                    .item(
+                                        delete_menu_item(cx).on_click(move |_, window, cx| {
+                                            delete.update(cx, |this, cx| {
+                                                this.confirm_delete(window, cx)
+                                            });
+                                        }),
+                                    )
+                                }),
+                        )
+                    }),
             )
-            .when(count > 0, |s| {
-                s.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .bg(cx.theme().muted)
-                        .child(format!("{count} selected"))
-                        .child(
-                            Button::new("mark-watched")
-                                .ghost()
-                                .label("Mark watched")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.mark_selection(true, cx)),
-                                ),
-                        )
-                        .child(
-                            Button::new("mark-unwatched")
-                                .ghost()
-                                .label("Mark unwatched")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.mark_selection(false, cx)),
-                                ),
-                        )
-                        .child(
-                            Button::new("delete-clips")
-                                .danger()
-                                .label("Delete")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.confirm_delete(window, cx)
-                                })),
-                        ),
-                )
-            })
-            .when_some(self.error.clone(), |s, error| {
-                s.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(cx.theme().danger)
-                        .child(error)
-                        .child(
-                            Button::new("dismiss-library-error")
-                                .ghost()
-                                .label("Dismiss")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.error = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-            })
             .when(self.rows.is_empty(), |s| {
                 s.child(div().p_8().text_color(cx.theme().muted_foreground).child(
                     if self.config_ready {
-                        "No clips here. Detect clips or add a folder to get started."
+                        "No clips here. Open Settings to detect clips or add a folder."
                     } else {
                         "Loading library…"
                     },
@@ -951,11 +1075,72 @@ impl Render for ClipBrowser {
                 .flex_1()
                 .min_h_0(),
             )
+            .into_any_element()
+    }
+}
+
+impl ClipBrowser {
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = self.config.clip_discovery == Discovery::Enabled;
+        div().id("settings-page").size_full().overflow_y_scroll().p_6().flex().flex_col().gap_4()
+            .child(div().flex().items_center().gap_3()
+                .child(Button::new("settings-back").ghost().icon(IconName::ChevronLeft).label("Back")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserEvent::CloseSettings))))
+                .child(div().text_xl().child("Settings")))
+            .child(div().text_lg().child("Listed folders"))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Removing a folder only removes it from the library. Your files and watched history are kept."))
+            .children(self.config.clip_directories.iter().enumerate().map(|(index, path)| {
+                let remove = path.clone();
+                div().flex().items_center().gap_3().p_3().border_1().border_color(cx.theme().border).rounded_lg()
+                    .child(Icon::new(IconName::FolderOpen))
+                    .child(div().flex_1().min_w_0()
+                        .child(div().truncate().child(crate::clip_store::display_path(path)))
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                            .child(if path.is_dir() { "Monitored" } else { "Unavailable. Scanning resumes when the drive reconnects." })))
+                    .child(Button::new(("remove-folder", index)).ghost().label("Remove")
+                        .on_click(cx.listener(move |this, _, _, _| this.worker.send(Request::RemoveFolder(remove.clone())))))
+            }))
+            .when(self.config.clip_directories.is_empty(), |s| s.child("No folders added yet."))
+            .child(Button::new("settings-add-folder").ghost().icon(IconName::FolderOpen).label("Add folder")
+                .on_click(cx.listener(|this, _, window, cx| this.add_folder(window, cx))))
+            .child(div().mt_4().text_lg().child("NVIDIA folder discovery"))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Automatically discover NVIDIA Overlay's recording folder. Turning this off does not stop scanning or watching listed folders."))
+            .child(div().flex().items_center().gap_3()
+                .child(Checkbox::new("automatic-discovery").label("Automatic discovery").checked(enabled)
+                    .on_click(cx.listener(move |this, _, _, _| this.worker.send(Request::Consent(!enabled)))))
+                .child(Button::new("settings-detect").ghost().label("Detect now")
+                    .on_click(cx.listener(|this, _, _, _| this.worker.send(Request::Detect)))))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                .child(if enabled { "Enabled. NVIDIA's current folder may be added again if removed." } else { "Disabled. Manual detection is still available." }))
+            .child(div().mt_4().text_lg().child("Keyboard shortcuts"))
+            .children(crate::PLAYER_SHORTCUTS.iter().map(|(action, shortcut)| {
+                div().flex().justify_between().max_w(px(600.)).text_sm().gap_4()
+                    .child(*action).child(*shortcut)
+            }))
+            .child(div().mt_4().text_lg().child("About"))
+            .child(format!("Spacer {} · Embedded libmpv", env!("CARGO_PKG_VERSION")))
     }
 }
 
 fn opens_clip(modifiers: &Modifiers) -> bool {
     *modifiers == Modifiers::default()
+}
+
+fn context_targets(selected: &HashSet<PathBuf>, path: &Path) -> Vec<PathBuf> {
+    if selected.contains(path) {
+        let mut paths = selected.iter().cloned().collect::<Vec<_>>();
+        paths.sort();
+        paths
+    } else {
+        vec![path.to_owned()]
+    }
+}
+
+fn delete_menu_item(cx: &App) -> PopupMenuItem {
+    PopupMenuItem::element(|_, cx| div().text_color(cx.theme().danger).child("Delete"))
+        .icon(Icon::new(gpui_kit::assets::IconName::Trash).text_color(cx.theme().danger))
 }
 
 fn folder_row(path: PathBuf, catalog: &Catalog) -> Option<Row> {
@@ -981,9 +1166,26 @@ fn name(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Row, folder_row, opens_clip};
+    use super::{Row, context_targets, folder_row, opens_clip};
     use crate::clip_library::{Catalog, scan};
     use gpui_kit::Modifiers;
+    use std::{collections::HashSet, path::PathBuf};
+    #[test]
+    fn right_click_targets_rows_without_changing_selection() {
+        let first = PathBuf::from("first.mp4");
+        let second = PathBuf::from("second.mp4");
+        let third = PathBuf::from("third.mp4");
+        let selected = HashSet::from([first.clone(), second.clone()]);
+        assert_eq!(
+            context_targets(&selected, &second),
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(context_targets(&selected, &third), vec![third.clone()]);
+        assert_eq!(selected, HashSet::from([first, second]));
+        let empty = HashSet::new();
+        assert_eq!(context_targets(&empty, &third), vec![third]);
+        assert!(empty.is_empty());
+    }
     #[test]
     fn renaming_a_history_view_updates_selection_and_anchor() {
         let old = std::path::PathBuf::from("Game/old.mp4");
