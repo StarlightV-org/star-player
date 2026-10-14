@@ -1,0 +1,9 @@
+[package]
+name = "spacer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = { version = "0.7.3", features = ["gpui-fast"] }
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit"] }
