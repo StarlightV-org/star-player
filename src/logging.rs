@@ -25,6 +25,16 @@ struct Logger {
 }
 static LOGGER: OnceLock<Option<Logger>> = OnceLock::new();
 
+/// Reuse an existing terminal for diagnostics, without creating a console.
+pub fn attach_parent_terminal() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    unsafe {
+        let _ = windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
+    }
+}
+
 fn logger() -> Option<&'static Logger> {
     LOGGER
         .get_or_init(|| {

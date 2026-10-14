@@ -170,11 +170,16 @@ hides the child when its parent is minimized. Closing stops and joins playback
 before destroying the host; teardown services synchronous native messages.
 
 The GPUI window and its kit `Root` use transparent backgrounds. The main area
-stays unpainted; only floating UI paints translucent backgrounds. On the current
+stays unpainted during playback; the empty startup screen paints an opaque theme
+background. Floating UI paints translucent backgrounds. On the current
 Windows backend, GPUI's DirectComposition layer sits above child HWNDs and can
 display controls and thumbnails over native video without a texture bridge or
 additional native overlay window. An opaque root hides the video even while
 audio and GPU output run. Other GPUI backends need separate composition testing.
+
+Release builds use the Windows GUI subsystem and do not open a console when
+launched from Explorer. They reuse the parent's terminal when one is available.
+Debug builds retain the console subsystem for development.
 
 Launching from an attached terminal enables the shared `Print` logger. Its
 bounded asynchronous queue drops excess messages rather than blocking playback.

@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use components::{
     audio_tracks::{AudioTracks, TrackGainEvent},
     media_controls::{MediaControls, MediaControlsEvent},
@@ -475,6 +477,7 @@ impl Render for PlayerShell {
                         .absolute()
                         .inset_0()
                         .occlude()
+                        .bg(cx.theme().background.opacity(1.0))
                         .flex()
                         .flex_col()
                         .items_center()
@@ -806,6 +809,7 @@ mod styling_tests {
 }
 
 fn main() {
+    logging::attach_parent_terminal();
     logging::Print(logging::Level::Info, "Starting Spacer");
     application().with_assets(app_assets::AppAssets).run(|cx| {
         init(cx);

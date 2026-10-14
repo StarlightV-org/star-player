@@ -120,9 +120,6 @@ fn bundle() -> Result<(), Box<dyn Error>> {
 }
 
 fn download(destination: &Path) -> Result<(), Box<dyn Error>> {
-    println!(
-        "cargo:warning=Downloading pinned libmpv for embedding. End users do not need a decoder installation."
-    );
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
         .build()?;
