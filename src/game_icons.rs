@@ -11,6 +11,25 @@ use std::{
     thread,
 };
 
+pub const CUSTOM_ICON_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "ico", "exe"];
+
+fn cache_custom(dir: &Path, source: &Path) -> Result<String, String> {
+    let allowed = source
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|extension| {
+            CUSTOM_ICON_EXTENSIONS
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+        });
+    if !allowed {
+        return Err("Choose a PNG, JPEG, ICO, or EXE file".into());
+    }
+    // Extract resource index 0 for executables. This reads resources, never
+    // launches the selected program, and publishes the resulting cached PNG.
+    cache_source(dir, source, 0)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Game {
     pub name: String,
@@ -290,7 +309,7 @@ fn cached_image(dir: &Path, hash: &str) -> Result<image::RgbaImage, String> {
 }
 
 pub enum Request {
-    /// The UI sends this only after the user confirms each scan.
+    /// Requires saved Steam discovery permission. Never sent automatically at startup.
     Detect(Option<PathBuf>),
     Folders(Vec<PathBuf>),
     Custom(PathBuf, PathBuf),
@@ -303,6 +322,7 @@ pub enum Event {
     State(State),
     Image(String, Option<image::RgbaImage>),
     Detected(String),
+    Warning(String),
     Error(String),
 }
 pub struct Worker {
@@ -352,6 +372,28 @@ impl Drop for Worker {
         }
     }
 }
+fn publish_scan(
+    dir: &Path,
+    state: &mut State,
+    next: &mut State,
+    folders: &[PathBuf],
+    events: &mpsc::Sender<Event>,
+) -> Result<(), String> {
+    save_catalog(dir, next)?;
+    state.games = next.games.clone();
+    let saved = if next.match_folders(folders) {
+        save_folders(dir, next)
+    } else {
+        Ok(())
+    };
+    if saved.is_ok() {
+        *state = next.clone();
+    }
+    // Even if saving assignments fails, the successfully saved catalog is usable.
+    let _ = events.send(Event::State(state.clone()));
+    saved
+}
+
 fn run(
     dir: &Path,
     requests: mpsc::Receiver<Request>,
@@ -385,6 +427,12 @@ fn run(
             let mut next = state.clone();
             match request {
                 Request::Detect(root) => {
+                    let store = dir.parent().ok_or("Missing icon store parent")?;
+                    if clip_store::read_config(store)?.steam_discovery
+                        != clip_store::Discovery::Enabled
+                    {
+                        return Err("Approve local Steam game searches in Settings first.".into());
+                    }
                     let root = root.map(Ok).unwrap_or_else(steam_games::locate)?;
                     let directories = shortcut_dirs
                         .clone()
@@ -393,7 +441,18 @@ fn run(
                     let count = scan.games.len();
                     let mut warnings = scan.warnings;
                     let mut copied = 0;
-                    for game in scan.games {
+                    // Include all names before matching any folders. A matching
+                    // title in a later batch must still make an earlier one ambiguous.
+                    for game in &scan.games {
+                        next.games
+                            .entry(game.id)
+                            .and_modify(|cached| cached.name = game.name.clone())
+                            .or_insert(Game {
+                                name: game.name.clone(),
+                                image: None,
+                            });
+                    }
+                    for (index, game) in scan.games.into_iter().enumerate() {
                         let mut image = next.games.get(&game.id).and_then(|g| g.image.clone());
                         for (path, index) in game.icons {
                             match cache_source(dir, &path, index) {
@@ -412,16 +471,30 @@ fn run(
                                 image,
                             },
                         );
+                        // Publish small batches so found icons appear while the
+                        // rest of the search runs, without writing JSON per game.
+                        if index % 8 == 7 {
+                            publish_scan(dir, &mut state, &mut next, &folders, &events)?;
+                        }
                     }
-                    save_catalog(dir, &next)?;
-                    // Publish a successful catalog even if assignment saving fails.
-                    state.games = next.games.clone();
-                    let _ = events.send(Event::State(state.clone()));
-                    if next.match_folders(&folders) {
-                        save_folders(dir, &next)?;
-                    }
+                    publish_scan(dir, &mut state, &mut next, &folders, &events)?;
                     for warning in &warnings {
                         crate::logging::Print(crate::logging::Level::Warn, warning);
+                    }
+                    if !warnings.is_empty() {
+                        let details = warnings
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let remaining = warnings.len().saturating_sub(3);
+                        let extra = if remaining > 0 {
+                            format!("\n{remaining} additional warnings were logged.")
+                        } else {
+                            String::new()
+                        };
+                        let _ = events.send(Event::Warning(format!("{} metadata or image warnings. Other games are still usable.\n{details}{extra}", warnings.len())));
                     }
                     let _ = events.send(Event::Detected(format!("Detected {count} Steam games; copied {copied} icons. {} metadata or image warnings. Games without local artwork keep the folder icon.", warnings.len())));
                 }
@@ -436,7 +509,7 @@ fn run(
                     if !folder.is_absolute() {
                         return Err("Icon folder must be absolute".into());
                     }
-                    let hash = cache_pixels(dir, decode(&source)?)?;
+                    let hash = cache_custom(dir, &source)?;
                     next.folders
                         .entry(folder_key(&folder))
                         .or_default()
@@ -681,6 +754,57 @@ mod tests {
         assert!(decode(&path).is_err());
         assert!(cache_pixels(&path, image::RgbaImage::new(1, 1)).is_err());
     }
+
+    #[test]
+    fn custom_icons_reject_unlisted_extensions_even_with_valid_image_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("cache");
+        let png = encoded_png(image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_pixel(8, 8, image::Rgba([12, 34, 56, 255])),
+        ));
+        for extension in ["bmp", "webp", "gif", "svg", "dll", "txt", ""] {
+            let source = temp.path().join(format!("custom.{extension}"));
+            fs::write(&source, &png).unwrap();
+            assert!(
+                cache_custom(&store, &source)
+                    .unwrap_err()
+                    .contains("PNG, JPEG, ICO, or EXE")
+            );
+        }
+        assert!(!store.exists());
+        for extension in ["png", "PNG", "jpg", "JPEG", "ico", "ICO"] {
+            let source = temp.path().join(format!("custom.{extension}"));
+            fs::write(&source, &png).unwrap();
+            assert!(cache_custom(&store, &source).is_ok());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn custom_executable_icon_is_extracted_and_persists_without_the_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let system = std::env::current_exe().unwrap();
+        // The test executable includes Spacer's embedded application icon.
+        // ExtractIconEx reads its resources; no process is started.
+        let exe = temp.path().join("selected.EXE");
+        fs::copy(system, &exe).unwrap();
+        let expected = executable_icon(&exe, 0).unwrap();
+        let folder = temp.path().join("Clips/Game");
+        let store = temp.path().join("store");
+        let worker = Worker::with_shortcuts(Some(store.clone()), Some(Vec::new()));
+        let _ = receive_state(&worker);
+        worker.send(Request::Custom(folder.clone(), exe.clone()));
+        let state = receive_state(&worker);
+        let hash = state.image(&folder).unwrap().to_owned();
+        fs::remove_file(exe).unwrap();
+        assert_eq!(
+            cached_image(&store.join("game-icons"), &hash).unwrap(),
+            expected
+        );
+        drop(worker);
+        let worker = Worker::with_shortcuts(Some(store), Some(Vec::new()));
+        assert_eq!(receive_state(&worker).image(&folder), Some(hash.as_str()));
+    }
     #[test]
     fn worker_startup_does_not_discover_steam() {
         let temp = tempfile::tempdir().unwrap();
@@ -742,6 +866,14 @@ mod tests {
                 .save(steam.join(format!("appcache/librarycache/{id}_icon.png")))
                 .unwrap();
         }
+        clip_store::save_config(
+            &store,
+            &clip_store::Config {
+                steam_discovery: clip_store::Discovery::Enabled,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let worker = Worker::with_shortcuts(Some(store.clone()), Some(Vec::new()));
         assert!(receive_state(&worker).games.is_empty());
         worker.send(Request::Folders(vec![folder.clone(), no_match.clone()]));
@@ -810,6 +942,92 @@ mod tests {
             Event::Error(_)
         ));
         assert_eq!(fs::read(dir.join("folders.json")).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn searches_require_saved_permission_and_respect_revocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker = Worker::with_shortcuts(Some(temp.path().to_owned()), Some(Vec::new()));
+        let _ = receive_state(&worker);
+        let invalid_root = temp.path().join("Missing Steam");
+        worker.send(Request::Detect(Some(invalid_root.clone())));
+        assert!(
+            matches!(worker.rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), Event::Error(e) if e.contains("Approve"))
+        );
+        assert!(!temp.path().join("game-icons").exists());
+        let mut config = clip_store::Config {
+            steam_discovery: clip_store::Discovery::Enabled,
+            ..Default::default()
+        };
+        clip_store::save_config(temp.path(), &config).unwrap();
+        worker.send(Request::Detect(Some(invalid_root.clone())));
+        assert!(
+            matches!(worker.rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), Event::Error(e) if e.contains("steamapps"))
+        );
+        config.steam_discovery = clip_store::Discovery::Declined;
+        clip_store::save_config(temp.path(), &config).unwrap();
+        worker.send(Request::Detect(Some(invalid_root)));
+        assert!(
+            matches!(worker.rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), Event::Error(e) if e.contains("Approve"))
+        );
+    }
+
+    #[test]
+    fn searches_publish_batches_and_warning_events_without_ambiguous_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let steam = temp.path().join("Steam");
+        fs::create_dir_all(steam.join("steamapps")).unwrap();
+        for id in 1..=10 {
+            let name = match id {
+                1 => "Game-A".to_owned(),
+                10 => "GameA".to_owned(),
+                _ => format!("Game0 {id}"),
+            };
+            fs::write(
+                steam.join(format!("steamapps/appmanifest_{id}.acf")),
+                format!("AppState {{ appid {id} name \"{name}\" }}"),
+            )
+            .unwrap();
+        }
+        fs::write(steam.join("steamapps/appmanifest_99.acf"), "broken {").unwrap();
+        clip_store::save_config(
+            &store,
+            &clip_store::Config {
+                steam_discovery: clip_store::Discovery::Enabled,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let worker = Worker::with_shortcuts(Some(store), Some(Vec::new()));
+        let _ = receive_state(&worker);
+        let folder = temp.path().join("Clips/Game A");
+        worker.send(Request::Folders(vec![folder.clone()]));
+        worker.send(Request::Detect(Some(steam)));
+        let mut batches = 0;
+        let mut warning = false;
+        loop {
+            match worker
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            {
+                Event::State(state) => {
+                    batches += 1;
+                    assert_eq!(state.games.len(), 10);
+                    assert!(!state.folders.contains_key(&folder_key(&folder)));
+                }
+                Event::Warning(message) => {
+                    warning = true;
+                    assert!(message.contains("appmanifest_99.acf"));
+                }
+                Event::Detected(_) => break,
+                Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(batches >= 2);
+        assert!(warning);
     }
     #[test]
     fn decoder_limits_dimensions_and_file_size() {

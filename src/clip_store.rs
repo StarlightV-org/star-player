@@ -22,6 +22,7 @@ pub enum Discovery {
 pub struct Config {
     pub version: u32,
     pub clip_discovery: Discovery,
+    pub steam_discovery: Discovery,
     pub clip_directories: Vec<PathBuf>,
     pub game_folder_sort: String,
     pub volume: f64,
@@ -33,6 +34,7 @@ impl Default for Config {
         Self {
             version: 1,
             clip_discovery: Discovery::NotAsked,
+            steam_discovery: Discovery::NotAsked,
             clip_directories: vec![],
             game_folder_sort: "newest_clip".into(),
             volume: 100.0,

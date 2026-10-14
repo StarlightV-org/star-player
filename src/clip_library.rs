@@ -134,6 +134,7 @@ pub fn scan(roots: &[PathBuf]) -> (Catalog, Vec<String>) {
 
 pub enum Request {
     Consent(bool),
+    SteamConsent(bool),
     AddFolder(PathBuf),
     RemoveFolder(PathBuf),
     Detect,
@@ -149,6 +150,7 @@ pub enum Request {
 }
 pub enum Event {
     Config(Config),
+    SteamConsent(Result<bool, String>),
     Catalog(Catalog),
     History(History),
     Thumbnail(PathBuf, Stamp, Option<image::RgbaImage>),
@@ -378,6 +380,30 @@ fn run(
                             } else {
                                 let _ = events.send(Event::RenameFailed(path, e.message));
                             }
+                        }
+                    }
+                }
+                Request::SteamConsent(enabled) => {
+                    if !config_valid {
+                        let _ = events.send(Event::SteamConsent(Err(
+                            "Repair config.json before saving Steam permissions".into(),
+                        )));
+                        continue;
+                    }
+                    let mut next = config.clone();
+                    next.steam_discovery = if enabled {
+                        Discovery::Enabled
+                    } else {
+                        Discovery::Declined
+                    };
+                    match clip_store::save_config(dir, &next) {
+                        Ok(()) => {
+                            config = next;
+                            let _ = events.send(Event::Config(config.clone()));
+                            let _ = events.send(Event::SteamConsent(Ok(enabled)));
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::SteamConsent(Err(e)));
                         }
                     }
                 }
@@ -821,6 +847,49 @@ fn rename_clip(
 mod tests {
     use super::*;
     #[test]
+    fn steam_permission_ack_follows_saved_config_and_rejects_invalid_config() {
+        let store = tempfile::tempdir().unwrap();
+        let worker = LibraryWorker::for_test(store.path().to_owned());
+        worker.send(Request::SteamConsent(true));
+        let mut published = false;
+        loop {
+            match worker.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::Config(config) if config.steam_discovery == Discovery::Enabled => {
+                    published = true
+                }
+                Event::SteamConsent(Ok(true)) => {
+                    assert!(published);
+                    assert_eq!(
+                        clip_store::read_config(store.path())
+                            .unwrap()
+                            .steam_discovery,
+                        Discovery::Enabled
+                    );
+                    break;
+                }
+                Event::Error(e) | Event::SteamConsent(Err(e)) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        drop(worker);
+        fs::write(store.path().join("config.json"), b"broken").unwrap();
+        let worker = LibraryWorker::for_test(store.path().to_owned());
+        worker.send(Request::SteamConsent(true));
+        loop {
+            match worker.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::SteamConsent(Err(_)) => break,
+                Event::SteamConsent(Ok(_)) => {
+                    panic!("Invalid configuration must not grant permission")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            fs::read(store.path().join("config.json")).unwrap(),
+            b"broken"
+        );
+    }
+    #[test]
     fn settings_disable_discovery_and_remove_roots_without_deleting_files() {
         let store = tempfile::tempdir().unwrap();
         let clips = tempfile::tempdir().unwrap();
@@ -854,6 +923,19 @@ mod tests {
         let saved = clip_store::read_config(store.path()).unwrap();
         assert_eq!(saved.clip_discovery, clip_store::Discovery::Declined);
         assert!(saved.clip_directories.is_empty());
+        worker.send(Request::SteamConsent(true));
+        let allowed = wait_config(&|config| config.steam_discovery == Discovery::Enabled);
+        assert_eq!(allowed.clip_discovery, Discovery::Declined);
+        assert!(allowed.clip_directories.is_empty());
+        assert!(!store.path().join("game-icons").exists());
+        worker.send(Request::SteamConsent(false));
+        wait_config(&|config| config.steam_discovery == Discovery::Declined);
+        assert_eq!(
+            clip_store::read_config(store.path())
+                .unwrap()
+                .steam_discovery,
+            Discovery::Declined
+        );
     }
 
     #[test]

@@ -65,6 +65,9 @@ pub struct ClipBrowser {
     icon_images: HashMap<String, Option<Arc<RenderImage>>>,
     icon_requested: HashSet<String>,
     detecting_icons: bool,
+    steam_prompt_pending: bool,
+    steam_scan_pending: Option<Option<PathBuf>>,
+    steam_prompt_open: bool,
     icon_picker_subscription: Option<Subscription>,
     icon_picker_observer: Option<Subscription>,
     config: Config,
@@ -132,6 +135,9 @@ impl ClipBrowser {
             icon_images: HashMap::new(),
             icon_requested: HashSet::new(),
             detecting_icons: false,
+            steam_prompt_pending: false,
+            steam_scan_pending: None,
+            steam_prompt_open: false,
             icon_picker_subscription: None,
             icon_picker_observer: None,
             config: Config::default(),
@@ -179,9 +185,10 @@ impl ClipBrowser {
                 }
                 game_icons::Event::Detected(message) => {
                     self.detecting_icons = false;
-                    window.open_alert_dialog(cx, move |alert, _, _| {
-                        alert.title("Steam game icons").description(message.clone())
-                    });
+                    crate::notifications::success(window, cx, "Steam search complete", &message);
+                }
+                game_icons::Event::Warning(message) => {
+                    crate::notifications::warning(window, cx, "Steam search warnings", &message);
                 }
                 game_icons::Event::Error(error) => {
                     self.detecting_icons = false;
@@ -210,6 +217,18 @@ impl ClipBrowser {
                     self.config_ready = true;
                     self.rebuild();
                 }
+                Event::SteamConsent(result) => match result {
+                    Ok(true) => {
+                        if let Some(root) = self.steam_scan_pending.take() {
+                            self.start_steam_scan(root, cx);
+                        }
+                    }
+                    Ok(false) => self.steam_scan_pending = None,
+                    Err(error) => {
+                        self.steam_scan_pending = None;
+                        cx.emit(BrowserEvent::Error(error));
+                    }
+                },
                 Event::Catalog(catalog) => {
                     self.catalog = catalog;
                     self.thumbnails.retain(|p, (s, _)| {
@@ -300,7 +319,13 @@ impl ClipBrowser {
             self.prompt_on_start = false;
             if self.config.clip_discovery == Discovery::NotAsked {
                 self.prompt(window, cx);
+            } else if should_prompt_steam(&self.config) {
+                self.approve_steam_scan(None, window, cx);
             }
+        }
+        if visible && self.steam_prompt_pending && should_prompt_steam(&self.config) {
+            self.steam_prompt_pending = false;
+            self.approve_steam_scan(None, window, cx);
         }
     }
 
@@ -309,10 +334,13 @@ impl ClipBrowser {
         let no = yes.clone();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let yes = yes.clone(); let no = no.clone();
-            alert.title("Detect local game clips?")
+            alert.title("Allow NVIDIA Overlay folder discovery?")
                 .description("Spacer can read NVIDIA Overlay's gallery location and watch that folder for clips. Your choice is saved locally.")
                 .confirm().ok_text("Detect clips").cancel_text("Not now").close_button(false)
-                .on_ok(move |_, _, cx| { let _ = yes.update(cx, |this, _| this.worker.send(Request::Consent(true))); true })
+                .on_ok(move |_, _, cx| { let _ = yes.update(cx, |this, _| {
+                    this.steam_prompt_pending = true;
+                    this.worker.send(Request::Consent(true));
+                }); true })
                 .on_cancel(move |_, _, cx| { let _ = no.update(cx, |this, _| this.worker.send(Request::Consent(false))); true })
         });
     }
@@ -1064,19 +1092,6 @@ impl Render for ClipBrowser {
                             .ghost()
                             .label("Open file")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserEvent::Open))),
-                    )
-                    .child(
-                        Button::new("library-steam-icons")
-                            .ghost()
-                            .label(if self.detecting_icons {
-                                "Detecting icons…"
-                            } else {
-                                "Detect Steam icons…"
-                            })
-                            .disabled(self.detecting_icons)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.approve_steam_scan(None, window, cx)
-                            })),
                     ),
             )
             .child(
@@ -1226,32 +1241,56 @@ impl ClipBrowser {
     }
 
     fn approve_steam_scan(
-        &self,
+        &mut self,
         root: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.detecting_icons {
+        if self.detecting_icons || self.steam_scan_pending.is_some() || self.steam_prompt_open {
             return;
         }
+        if self.config.steam_discovery == Discovery::Enabled {
+            self.start_steam_scan(root, cx);
+            return;
+        }
+        self.steam_prompt_open = true;
         let owner = cx.weak_entity();
+        let decline = owner.clone();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let owner = owner.clone();
+            let decline = decline.clone();
             let root = root.clone();
-            alert.title("Detect Steam game icons?")
-                .description("Spacer will read local Steam game metadata, cached artwork, and Steam shortcuts on your desktop and Start menu. Available icons will be copied into .spacer. No network requests are made and Steam files are not changed. Cached icons remain after uninstalling games.")
-                .confirm().ok_text("Detect icons").cancel_text("Not now")
+            alert.title("Search for local Steam games?")
+                .description("Spacer can find installed Steam games and use their local icons for your clip folders. Your choice is saved locally.")
+                .confirm().ok_text("Search games").cancel_text("Not now").close_button(false)
                 .on_ok(move |_, _, cx| {
                     let _ = owner.update(cx, |this, cx| {
-                        if !this.detecting_icons {
-                            this.detecting_icons = true;
-                            this.icon_worker.send(IconRequest::Detect(root.clone()));
-                            cx.notify();
-                        }
+                        this.steam_prompt_open = false;
+                        this.steam_scan_pending = Some(root.clone());
+                        this.worker.send(Request::SteamConsent(true));
+                        cx.notify();
+                    });
+                    true
+                })
+                .on_cancel(move |_, _, cx| {
+                    let _ = decline.update(cx, |this, cx| {
+                        this.steam_prompt_open = false;
+                        this.steam_scan_pending = None;
+                        this.worker.send(Request::SteamConsent(false));
+                        cx.notify();
                     });
                     true
                 })
         });
+    }
+
+    fn start_steam_scan(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.config.steam_discovery != Discovery::Enabled || self.detecting_icons {
+            return;
+        }
+        self.detecting_icons = true;
+        self.icon_worker.send(IconRequest::Detect(root));
+        cx.notify();
     }
 
     fn select_steam_folder(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1279,12 +1318,33 @@ impl ClipBrowser {
         .detach();
     }
 
+    #[cfg(windows)]
+    fn custom_icon(&self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        // GPUI's path prompt has no extension filters. Use a parented native
+        // dialog here, and validate again in the worker for manually typed paths.
+        let selection = rfd::AsyncFileDialog::new()
+            .set_title("Choose a PNG, JPEG, ICO, or EXE file")
+            .add_filter("Icons and executables", game_icons::CUSTOM_ICON_EXTENSIONS)
+            .set_parent(window)
+            .pick_file();
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(file) = selection.await {
+                let path = file.path().to_owned();
+                let _ = this.update_in(cx, |this, _, _| {
+                    this.icon_worker.send(IconRequest::Custom(folder, path));
+                });
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(not(windows))]
     fn custom_icon(&self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let selection = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Choose a PNG, JPEG, or ICO image".into()),
+            prompt: Some("Choose a PNG, JPEG, ICO, or EXE file".into()),
         });
         cx.spawn_in(window, async move |this, cx| match selection.await {
             Ok(Ok(Some(paths))) => {
@@ -1378,6 +1438,8 @@ impl ClipBrowser {
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let enabled = self.config.clip_discovery == Discovery::Enabled;
+        let steam_enabled = self.config.steam_discovery == Discovery::Enabled;
+        let steam_busy = self.detecting_icons || self.steam_scan_pending.is_some();
         div().id("settings-page").size_full().overflow_y_scroll().p_6().flex().flex_col().gap_4()
             .child(div().flex().items_center().gap_3()
                 .child(Button::new("settings-back").ghost().icon(IconName::ChevronLeft).label("Back")
@@ -1405,20 +1467,30 @@ impl ClipBrowser {
                 .child("Automatically discover NVIDIA Overlay's recording folder. Turning this off does not stop scanning or watching listed folders."))
             .child(div().flex().items_center().gap_3()
                 .child(Checkbox::new("automatic-discovery").label("Automatic discovery").checked(enabled)
-                    .on_click(cx.listener(move |this, _, _, _| this.worker.send(Request::Consent(!enabled)))))
+                    .on_click(cx.listener(move |this, _, _, _| {
+                        this.steam_prompt_pending = !enabled;
+                        this.worker.send(Request::Consent(!enabled));
+                    })))
                 .child(Button::new("settings-detect").ghost().label("Detect now")
                     .on_click(cx.listener(|this, _, _, _| this.worker.send(Request::Detect)))))
             .child(div().text_xs().text_color(cx.theme().muted_foreground)
                 .child(if enabled { "Enabled. NVIDIA's current folder may be added again if removed." } else { "Disabled. Manual detection is still available." }))
             .child(div().mt_4().text_lg().child("Steam game icons"))
             .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("Offline and manual. Every scan requires approval. Icons are kept in .spacer after games are uninstalled. Right-click a game folder to customize or restore its icon."))
+                .child("Spacer reads local Steam game manifests, Steam's image cache, and Steam shortcuts on your desktop and Start menu. Searches run in the background without network requests or changes to Steam files. There are no automatic Steam searches at startup."))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Available icons are copied to .spacer/game-icons/images as PNGs. The game catalog and folder assignments are saved alongside them. Icons remain after uninstalling games and are separate from the video thumbnail cache. Right-click a game folder to set a custom icon, select another game's icon, or restore its assigned icon."))
+            .child(Checkbox::new("steam-search-permission").label("Allow local Steam game searches").checked(steam_enabled)
+                .disabled(steam_busy).on_click(cx.listener(move |this, _, window, cx| {
+                    if steam_enabled { this.worker.send(Request::SteamConsent(false)); }
+                    else { this.approve_steam_scan(None, window, cx); }
+                })))
             .child(div().flex().items_center().gap_3()
-                .child(Button::new("detect-steam-icons").ghost().label(if self.detecting_icons { "Detecting…" } else { "Detect Steam game icons…" })
-                    .disabled(self.detecting_icons).on_click(cx.listener(|this, _, window, cx| this.approve_steam_scan(None, window, cx))))
+                .child(Button::new("search-steam-games").ghost().label(if steam_busy { "Searching…" } else { "Search now" })
+                    .disabled(steam_busy).on_click(cx.listener(|this, _, window, cx| this.approve_steam_scan(None, window, cx))))
                 .child(Button::new("choose-steam-folder").ghost().label("Choose Steam folder…")
-                    .disabled(self.detecting_icons).on_click(cx.listener(|this, _, window, cx| this.select_steam_folder(window, cx)))))
-            .child(format!("{} games with cached icons", self.icons.games.values().filter(|g| g.image.is_some()).count()))
+                    .disabled(steam_busy).on_click(cx.listener(|this, _, window, cx| this.select_steam_folder(window, cx)))))
+            .child(format!("{} detected games, {} with cached icons", self.icons.games.len(), self.icons.games.values().filter(|g| g.image.is_some()).count()))
             .child(div().mt_4().text_lg().child("Keyboard shortcuts"))
             .children(crate::PLAYER_SHORTCUTS.iter().map(|(action, shortcut)| {
                 div().flex().justify_between().max_w(px(600.)).text_sm().gap_4()
@@ -1434,6 +1506,10 @@ struct GameIconPicker {
     filtered: Vec<(u32, String, String)>,
     selected: Option<IndexPath>,
     owner: WeakEntity<ClipBrowser>,
+}
+
+fn should_prompt_steam(config: &Config) -> bool {
+    config.clip_discovery == Discovery::Enabled && config.steam_discovery == Discovery::NotAsked
 }
 impl ListDelegate for GameIconPicker {
     type Item = ListItem;
@@ -1560,6 +1636,25 @@ mod tests {
     use crate::clip_library::{Catalog, scan};
     use gpui_kit::Modifiers;
     use std::{collections::HashSet, path::PathBuf};
+    #[test]
+    fn steam_onboarding_follows_overlay_permission_and_does_not_repeat() {
+        let mut config = crate::clip_store::Config::default();
+        assert!(!super::should_prompt_steam(&config));
+        config.clip_discovery = crate::clip_store::Discovery::Declined;
+        assert!(!super::should_prompt_steam(&config));
+        config.clip_discovery = crate::clip_store::Discovery::Enabled;
+        assert!(super::should_prompt_steam(&config));
+        for choice in [
+            crate::clip_store::Discovery::Enabled,
+            crate::clip_store::Discovery::Declined,
+        ] {
+            config.steam_discovery = choice;
+            assert!(!super::should_prompt_steam(&config));
+        }
+        let old: crate::clip_store::Config =
+            serde_json::from_str(r#"{"clip_discovery":"enabled"}"#).unwrap();
+        assert!(super::should_prompt_steam(&old));
+    }
     #[test]
     fn right_click_targets_rows_without_changing_selection() {
         let first = PathBuf::from("first.mp4");

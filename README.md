@@ -36,8 +36,9 @@ Ship `target/release/spacer.exe`; no separate decoder files need to accompany it
 ## Local game clip library
 
 Launching without a file opens the clip library. On the first such launch,
-Spacer asks whether to detect NVIDIA Overlay recordings. Both acceptance and
-declining are saved in `%USERPROFILE%\.spacer\config.json`. Launching with a
+Spacer asks whether to allow NVIDIA Overlay folder discovery. If approved,
+it next asks whether to search for local Steam games and their icons. Both
+permission choices are saved in `%USERPROFILE%\.spacer\config.json`. Launching with a
 file skips the prompt. The title-bar cog opens **Settings**, where you can
 add or remove library folders, toggle automatic NVIDIA folder discovery, or
 use **Detect now**. Disabling discovery leaves listed folders monitored.
@@ -59,13 +60,20 @@ time if unavailable.
 
 ### Offline Steam game icons
 
-Use **Detect Steam icons…** in the library, or **Detect Steam game icons…**
-in Settings. Every scan requires confirmation. Spacer reads local Steam
+After approving NVIDIA Overlay discovery, approve the separate Steam game
+search prompt to start a background search. Declining either prompt does not
+prevent manual folder setup or custom icons. There is no Steam search button
+in the library. Use **Search now** in Settings to repeat a search. Steam
+permission is saved; if it has not been granted, Search now asks first.
+Turn off **Allow local Steam game searches** to revoke permission without
+removing cached icons. Spacer reads local Steam
 installation metadata, game manifests across Steam libraries, cached artwork,
 and Steam `.url` shortcuts on the desktop and in the Start menu. It makes no
 network requests, launches no games, and never changes Steam files. There are
-no automatic Steam scans at startup. If Steam cannot be located, use
-**Choose Steam folder…** in Settings; the scan still requires confirmation.
+no automatic Steam scans at startup. Found games and icons update the UI while
+the background search runs. Warnings and completion appear as notifications,
+not blocking dialogs. Settings explains the Steam image sources and cache.
+If Steam cannot be located, use **Choose Steam folder…** in Settings.
 
 Unique folder-name matches receive an icon automatically. Matching ignores
 case, whitespace, and punctuation, but does not use fuzzy search. Automatic
@@ -74,8 +82,11 @@ Nested folders keep their normal folder icon unless assigned manually. Games
 without usable local artwork also keep the normal icon.
 
 Right-click a folder for **Set custom icon…**, **Choose game icon…**, or
-**Restore assigned icon**. Custom images support PNG, JPEG, and ICO, up to
-16 MB and 4096 pixels per dimension. The searchable game picker includes
+**Restore assigned icon**. The custom-icon picker allows PNG, JPEG, ICO, and
+EXE files only. Selecting an EXE extracts its first icon without running it.
+The extracted icon is cached as PNG, so the executable is not needed afterward.
+Custom images are limited to 16 MB and 4096 pixels per dimension; this file-size
+limit does not apply to executables. The searchable game picker includes
 previously detected games, even after uninstalling them. Manual overrides
 survive rescans. Restoring clears the override and shows the automatic icon,
 or the normal folder icon if no automatic match exists.
