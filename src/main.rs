@@ -21,6 +21,7 @@ use std::{
 };
 
 mod app_assets;
+mod app_icon;
 mod components;
 mod logging;
 mod media_keys;
@@ -829,6 +830,7 @@ fn main() {
             ..Default::default()
         };
         cx.open_window(options, |window, cx| {
+            app_icon::apply(window);
             let player = cx.new(|cx| {
                 let mut player = PlayerShell::new(window, cx);
                 if let Some(path) = std::env::args_os().nth(1) {

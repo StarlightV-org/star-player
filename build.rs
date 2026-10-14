@@ -14,11 +14,54 @@ const MAX_DOWNLOAD: u64 = 64 * 1024 * 1024;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=licenses/THIRD_PARTY_NOTICES.md");
     println!("cargo:rerun-if-env-changed=SPACER_MPV_ARCHIVE");
     if let Err(error) = bundle() {
         panic!("Unable to embed Spacer's decoder: {error}");
     }
+    if let Err(error) = embed_icon() {
+        panic!("Unable to embed Spacer's icon: {error}");
+    }
+}
+
+fn embed_icon() -> Result<(), Box<dyn Error>> {
+    if env::var("CARGO_CFG_TARGET_OS")? != "windows" {
+        return Ok(());
+    }
+    let source = image::open("assets/icon.png")?;
+    let sizes = [16u32, 24, 32, 48, 64, 128, 256];
+    let mut images = Vec::new();
+    for size in sizes {
+        let resized = source.resize_exact(size, size, image::imageops::FilterType::Lanczos3);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        resized.write_to(&mut bytes, image::ImageFormat::Png)?;
+        images.push(bytes.into_inner());
+    }
+    // ICO directory followed by PNG-encoded images, including alpha channels.
+    let mut icon = Vec::new();
+    icon.extend_from_slice(&0u16.to_le_bytes());
+    icon.extend_from_slice(&1u16.to_le_bytes());
+    icon.extend_from_slice(&(sizes.len() as u16).to_le_bytes());
+    let mut offset = 6 + 16 * sizes.len() as u32;
+    for (size, bytes) in sizes.into_iter().zip(&images) {
+        icon.extend_from_slice(&[size as u8, size as u8, 0, 0]);
+        icon.extend_from_slice(&1u16.to_le_bytes());
+        icon.extend_from_slice(&32u16.to_le_bytes());
+        icon.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        icon.extend_from_slice(&offset.to_le_bytes());
+        offset += bytes.len() as u32;
+    }
+    for bytes in images {
+        icon.extend_from_slice(&bytes);
+    }
+    let path =
+        PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is missing")?).join("spacer.ico");
+    fs::write(&path, icon)?;
+    winresource::WindowsResource::new()
+        .set_icon(path.to_str().ok_or("non-UTF8 icon path")?)
+        .compile()?;
+    Ok(())
 }
 
 fn bundle() -> Result<(), Box<dyn Error>> {
