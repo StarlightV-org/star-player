@@ -5,6 +5,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 
 pub enum MediaControlsEvent {
+    Toggle,
     SeekBackward,
     SeekForward,
     Stop,
@@ -13,6 +14,15 @@ pub enum MediaControlsEvent {
 #[derive(Default)]
 pub struct MediaControls {
     playing: bool,
+}
+
+impl MediaControls {
+    pub fn set_playing(&mut self, playing: bool, cx: &mut Context<Self>) {
+        if self.playing != playing {
+            self.playing = playing;
+            cx.notify();
+        }
+    }
 }
 
 impl EventEmitter<MediaControlsEvent> for MediaControls {}
@@ -44,8 +54,8 @@ impl Render for MediaControls {
                     // .label(if self.playing { "Pause" } else { "Play" })
                     .tooltip(if self.playing { "Pause" } else { "Play" })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.playing = !this.playing;
-                        cx.notify();
+                        let _ = this;
+                        cx.emit(MediaControlsEvent::Toggle);
                     })),
             )
             .child(
