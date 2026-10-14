@@ -6,6 +6,8 @@ use std::cell::Cell;
 pub struct NativeVideo {
     hwnd: Cell<usize>,
     geometry: Cell<Option<([i32; 4], f32)>>,
+    #[cfg(windows)]
+    cursor: crate::window_cursor::WindowCursor,
     // Prevent moving this owner off the window's UI thread.
     _ui_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -24,6 +26,7 @@ impl NativeVideo {
             return Err("GPUI did not provide a Windows HWND".into());
         };
         let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let cursor = crate::window_cursor::WindowCursor::new(parent.hwnd.get() as _)?;
         // Disabled children do not take mouse/keyboard input. Clicks hit GPUI's
         // parent panel instead, even when mpv creates its own nested VO window.
         let hwnd = unsafe {
@@ -55,6 +58,7 @@ impl NativeVideo {
         Ok(Self {
             hwnd: Cell::new(hwnd as usize),
             geometry: Cell::new(None),
+            cursor,
             _ui_thread: std::marker::PhantomData,
         })
     }
@@ -66,6 +70,13 @@ impl NativeVideo {
 
     pub fn hwnd(&self) -> usize {
         self.hwnd.get()
+    }
+
+    pub fn set_cursor_hidden(&self, hidden: bool) {
+        #[cfg(windows)]
+        self.cursor.set_hidden(hidden);
+        #[cfg(not(windows))]
+        let _ = hidden;
     }
 
     pub fn layout(&self, bounds: Bounds<Pixels>, scale: f32) {
@@ -109,6 +120,7 @@ impl NativeVideo {
 
     /// Only call after Playback has stopped and joined its worker.
     pub fn destroy(&self) {
+        self.set_cursor_hidden(false);
         let hwnd = self.hwnd.replace(0);
         if hwnd == 0 {
             return;
@@ -206,6 +218,7 @@ mod tests {
         let host = NativeVideo {
             hwnd: Cell::new(child as usize),
             geometry: Cell::new(None),
+            cursor: crate::window_cursor::WindowCursor::new(parent).unwrap(),
             _ui_thread: std::marker::PhantomData,
         };
         let player = Playback::native(host.hwnd()).unwrap();

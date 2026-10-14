@@ -30,6 +30,7 @@ mod playback;
 mod preview;
 mod runtime;
 mod theme;
+mod window_cursor;
 
 /// GPUI's texture upload expects BGRA, while our decoders produce RGBA.
 fn render_image(mut pixels: image::RgbaImage) -> Arc<RenderImage> {
@@ -189,6 +190,9 @@ impl PlayerShell {
 
     fn reveal_controls(&mut self, cx: &mut Context<Self>) {
         self.last_activity = Instant::now();
+        if let Some(host) = &self.native_video {
+            host.set_cursor_hidden(false);
+        }
         if !self.controls_visible {
             self.controls_visible = true;
             cx.notify();
@@ -328,6 +332,9 @@ impl PlayerShell {
             self.controls_dragging,
             self.last_activity.elapsed(),
         );
+        if let Some(host) = &self.native_video {
+            host.set_cursor_hidden(!self.controls_visible);
+        }
         cx.notify();
     }
 
