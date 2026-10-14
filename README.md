@@ -116,27 +116,20 @@ the `Print` log reports the problem. Theme files are limited to 64 KiB.
 
 ## Headset audio routing
 
-The default output is **Stereo**. mpv downmixes surround sources
+Playback always uses the bundled OpenAL headset-compatibility output. There is
+no output-mode selector. mpv downmixes surround sources
 to stereo before handing them to Windows, rather than relying on a headset's
 advertised virtual surround layout. Downmix normalization is enabled to reduce
 clipping, and decoder-side downmixing is disabled so mpv handles the conversion.
 No EQ, bass boost or loudness effect is added. Track-mix gains remain independent.
 
-Use **System layout** in the audio mixer to follow the system's preferred
-channel layout instead. This choice lasts for the current session and switching
-it can briefly interrupt audio. Diagnostics report the audio backend, device,
-source channels and output channels.
-
-**Headset compatibility** is an opt-in alternative using the bundled OpenAL
-stereo output. It is intended for comparing headset-driver processing with the
-normal WASAPI route, not for adding bass boost or emulating Logitech DTS. Keep
-your desired G HUB effects enabled when comparing it. Switching routes can
-briefly interrupt audio. The normal route remains the default until listening
-tests establish whether this alternative helps your headset.
+Diagnostics report the audio backend, device, source channels and output
+channels. OpenAL does not emulate Logitech DTS. Keep your desired G HUB effects
+enabled; whether they apply still depends on the headset driver.
 
 Stereo routing is a workaround for a possible layout mismatch, not a confirmed
-diagnosis of the reported thin headset sound. Compare the same media in both
-modes and VLC. Windows spatial audio and vendor headset processing can still
+diagnosis of the reported thin headset sound. Compare the same media with VLC.
+Windows spatial audio and vendor headset processing can still
 affect the result. The six-channel fixture test verifies stereo output and
 preservation of volume, gains and pause state, not perceptual equivalence to VLC.
 

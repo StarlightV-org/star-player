@@ -53,17 +53,18 @@ the reported difference, and the checks did not find a different Windows device
 or session-volume attenuation. No additional EQ or arbitrary bass boost was
 added in response to this comparison.
 
-Spacer now offers an opt-in **Headset compatibility** output in the mixer. It
-uses the embedded decoder's OpenAL output with stereo channels, instead of the
-usual WASAPI output. It does not install a decoder, add an EQ or change G HUB
-settings. This is a backend comparison, not an implementation of Logitech DTS.
+Spacer now always uses the embedded decoder's OpenAL output with stereo
+channels, as requested. The mixer no longer offers an output-mode selection.
+It does not install a decoder, add an EQ or change G HUB settings. This is not
+an implementation of Logitech DTS. Backend switching remains available only
+inside diagnostic tests.
 The muted physical-output probe on this headset successfully switched between
 WASAPI stereo at 48 kHz and OpenAL stereo reported at 44.1 kHz, preserving mute.
 OpenAL's reported input format does not prove its internal device format or that
 the headset applies the desired effects. Listening confirmation is required.
 
-Restore the desired G HUB effects and compare **Headset compatibility** with
-**Stereo** using the same clip. If it does not restore the desired sound,
+Restore the desired G HUB effects and compare Spacer with VLC using the same
+clip. If it does not restore the desired sound,
 the next useful comparison is VLC's
 Messages window at verbosity 2, alongside Spacer's terminal diagnostics, with
 both applications using the same track, position and nominal volume. Compare

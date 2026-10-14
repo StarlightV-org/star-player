@@ -5,12 +5,12 @@ use components::{
     volume_controls::{VolumeControls, VolumeEvent},
 };
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Selectable as _,
+    ActiveTheme as _, IconName,
     button::{Button, ButtonVariants},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use playback::{AudioOutputMode, Command, Playback, Snapshot};
+use playback::{Command, Playback, Snapshot};
 use std::{
     path::PathBuf,
     rc::Rc,
@@ -522,7 +522,10 @@ impl Render for PlayerShell {
                             .child(
                                 div()
                                     .occlude()
-                                    .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::click_overlay),
+                                    )
                                     .min_w_0()
                                     .max_w(relative(0.7))
                                     .px_4()
@@ -538,7 +541,10 @@ impl Render for PlayerShell {
                             .child(
                                 div()
                                     .occlude()
-                                    .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::click_overlay),
+                                    )
                                     .flex()
                                     .items_center()
                                     .gap_1()
@@ -677,45 +683,6 @@ impl Render for PlayerShell {
                                             cx.notify();
                                         })),
                                 ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .mb_3()
-                                .child(
-                                    Button::new("stereo-output")
-                                        .ghost()
-                                        .label("Stereo")
-                                        .selected(
-                                            self.snapshot.audio_output == AudioOutputMode::Stereo,
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.command(
-                                                Command::SetAudioOutput(AudioOutputMode::Stereo),
-                                                cx,
-                                            )
-                                        })),
-                                )
-                                .child(
-                                    Button::new("system-output")
-                                        .ghost()
-                                        .label("System layout")
-                                        .selected(
-                                            self.snapshot.audio_output == AudioOutputMode::System,
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.command(
-                                                Command::SetAudioOutput(AudioOutputMode::System),
-                                                cx,
-                                            )
-                                        })),
-                                )
-                        .child(Button::new("headset-output").ghost().label("Headset compatibility")
-                            .tooltip("Try the bundled OpenAL output for headset-driver stereo processing")
-                            .selected(self.snapshot.audio_output == AudioOutputMode::HeadsetCompatible)
-                            .on_click(cx.listener(|this, _, _, cx| this.command(Command::SetAudioOutput(AudioOutputMode::HeadsetCompatible), cx)))),
                         )
                         .child(self.audio_tracks.clone()),
                 )

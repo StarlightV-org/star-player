@@ -58,6 +58,7 @@ pub struct Diagnostic {
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_DIAGNOSTIC_CHARS: usize = 1024;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AudioOutputMode {
     #[default]
@@ -66,6 +67,7 @@ pub enum AudioOutputMode {
     HeadsetCompatible,
 }
 
+#[cfg(test)]
 impl AudioOutputMode {
     fn channels(self) -> &'static str {
         match self {
@@ -93,6 +95,7 @@ pub struct Snapshot {
     pub muted: bool,
     pub speed: f64,
     pub effective_muted: bool,
+    #[cfg(test)]
     pub audio_output: AudioOutputMode,
     pub video_output: Option<String>,
     pub hardware_decoder: Option<String>,
@@ -118,6 +121,7 @@ impl Default for Snapshot {
             muted: false,
             speed: 1.0,
             effective_muted: true,
+            #[cfg(test)]
             audio_output: AudioOutputMode::default(),
             video_output: None,
             hardware_decoder: None,
@@ -206,6 +210,7 @@ pub enum Command {
     SetVolume(f64),
     SetMute(bool),
     SetSpeed(f64),
+    #[cfg(test)]
     SetAudioOutput(AudioOutputMode),
     SetTrackGain {
         id: i64,
@@ -583,6 +588,7 @@ impl Player {
                     ("vo", "gpu"),
                     ("gpu-context", "d3d11"),
                     ("hwdec", "auto"),
+                    ("audio-device", "openal"),
                     ("wid", &wid),
                     ("input-vo-keyboard", "no"),
                     ("input-cursor", "no"),
@@ -591,7 +597,7 @@ impl Player {
                 false,
             )
         } else {
-            Self::new_configured(mailbox, &[], false)
+            Self::new_configured(mailbox, &[("audio-device", "openal")], false)
         }
     }
 
@@ -990,6 +996,7 @@ impl Player {
                 finite_range(value, 0.01, 100.0, "Speed")?;
                 self.set("speed", &value.to_string())
             }
+            #[cfg(test)]
             Command::SetAudioOutput(mode) => {
                 if mode == AudioOutputMode::HeadsetCompatible {
                     let devices = self.property_node("audio-device-list")?;
@@ -1073,10 +1080,10 @@ impl Player {
                 Print(
                     Level::Info,
                     format!(
-                        "Audio device={:?} backend={:?} routing={:?} source={:?} output={:?}",
+                        "Audio device={:?} backend={:?} channels={:?} source={:?} output={:?}",
                         self.property_node("audio-device").ok(),
                         self.property_node("current-ao").ok(),
-                        self.state.audio_output,
+                        self.property_node("audio-channels").ok(),
                         self.property_node("audio-params").ok(),
                         self.property_node("audio-out-params").ok()
                     ),
@@ -1786,13 +1793,17 @@ mod tests {
         let output = PathBuf::from(
             std::env::var_os("SPACER_AUDIO_PROBE_OUTPUT").expect("Set SPACER_AUDIO_PROBE_OUTPUT"),
         );
-        let mut player =
-            Player::new_with_options(Arc::new(Mailbox::new()), &[("vid", "no")]).unwrap();
+        let mut player = Player::new_with_options(
+            Arc::new(Mailbox::new()),
+            &[("vid", "no"), ("audio-device", "openal")],
+        )
+        .unwrap();
         player.execute(Command::SetMute(true)).unwrap();
         player.execute(Command::Load(path)).unwrap();
         smoke_wait(&mut player, "muted native audio", |p| {
             p.property_node("audio-out-params").is_ok()
         });
+        assert_eq!(player.property_node("current-ao").unwrap(), "openal");
         let mut reports = Vec::new();
         for mode in [AudioOutputMode::Stereo, AudioOutputMode::HeadsetCompatible] {
             player.execute(Command::SetAudioOutput(mode)).unwrap();
