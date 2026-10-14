@@ -29,6 +29,7 @@ pub struct PreviewWorker {
     result: Arc<Mutex<Option<PreviewFrame>>>,
     latest: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
+    release: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -42,9 +43,15 @@ impl PreviewWorker {
         let outgoing = result.clone();
         let revision = latest.clone();
         let stop = stopping.clone();
+        let release = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
+        let release_request = release.clone();
         let worker = thread::spawn(move || {
             let mut decoder: Option<PreviewDecoder> = None;
             while !stop.load(Ordering::Acquire) {
+                if let Some(done) = release_request.lock().unwrap().take() {
+                    decoder = None;
+                    done.store(true, Ordering::Release);
+                }
                 let next = incoming.lock().unwrap().take();
                 let Some(mut next) = next else {
                     thread::sleep(Duration::from_millis(10));
@@ -86,12 +93,17 @@ impl PreviewWorker {
                     });
                 }
             }
+            drop(decoder);
+            if let Some(done) = release_request.lock().unwrap().take() {
+                done.store(true, Ordering::Release);
+            }
         });
         Self {
             request,
             result,
             latest,
             stopping,
+            release,
             worker: Some(worker),
         }
     }
@@ -110,6 +122,19 @@ impl PreviewWorker {
 
     pub fn take(&self) -> Option<PreviewFrame> {
         self.result.lock().unwrap().take()
+    }
+
+    /// Cancel queued/in-flight work and acknowledge when its file handle is closed.
+    pub fn release(&self) -> Arc<AtomicBool> {
+        let mut request = self.request.lock().unwrap();
+        self.latest.fetch_add(1, Ordering::AcqRel);
+        *request = None;
+        self.result.lock().unwrap().take();
+        let mut pending = self.release.lock().unwrap();
+        // Multiple callers may wait for the same release.
+        pending
+            .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
     }
 }
 
@@ -187,6 +212,13 @@ mod tests {
             again.as_raw(),
             "Backward seek returned a stale frame"
         );
+        let released = worker.release();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !released.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "Preview handle was not released");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(worker.take().is_none());
     }
 
     #[test]

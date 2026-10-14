@@ -87,6 +87,9 @@ impl AudioOutputMode {
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
+    pub path: Option<PathBuf>,
+    /// Latched only after decoder startup/restart completes during active play.
+    pub playback_started: bool,
     pub duration: f64,
     pub position: f64,
     pub paused: bool,
@@ -114,6 +117,8 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            path: None,
+            playback_started: false,
             duration: 0.0,
             position: 0.0,
             paused: true,
@@ -823,6 +828,9 @@ impl Player {
     }
 
     fn refresh(&mut self) {
+        if self.media_ready && self.frame_ready && !self.intended_paused {
+            self.state.playback_started = true;
+        }
         self.state.duration = self.number("duration").unwrap_or(0.0).max(0.0);
         self.state.position = self.number("time-pos").unwrap_or(0.0).max(0.0);
         // A native frame-step temporarily unpauses. Only explicit play commands
@@ -913,6 +921,7 @@ impl Player {
         Print(Level::Debug, format!("Playback command {command:?}"));
         match command {
             Command::Load(path) => {
+                let requested_path = path.clone();
                 let path = std::fs::canonicalize(&path)
                     .map_err(|e| format!("Open {}: {e}", path.display()))?;
                 let path = path.to_str().ok_or("Media path is not valid UTF-8")?;
@@ -939,6 +948,8 @@ impl Player {
                     .take();
                 self.state.position = 0.0;
                 self.state.duration = 0.0;
+                self.state.path = Some(requested_path);
+                self.state.playback_started = false;
                 self.command(&["loadfile", path, "replace"])?;
                 Ok(())
             }
@@ -2312,6 +2323,7 @@ mod tests {
                 .contains("Load/play media")
         );
         assert!(!player.media_ready && !player.frame_ready);
+        assert!(!player.state.playback_started);
         assert!(
             !player.state.diagnostics.is_empty(),
             "Native diagnostic was lost"
@@ -2339,6 +2351,38 @@ mod tests {
             title: String::new(),
             gain,
         }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn watched_signal_requires_playback_not_just_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clip.avi");
+        test_fixtures::avi(&path, 0, true);
+        let mut player =
+            Player::new_with_options(Arc::new(Mailbox::new()), &[("ao", "null")]).unwrap();
+        player.execute(Command::Load(path.clone())).unwrap();
+        player.execute(Command::Pause).unwrap();
+        smoke_wait(&mut player, "paused initial load", |p| {
+            p.frame_ready && p.state.paused
+        });
+        assert_eq!(player.state.path, Some(path.clone()));
+        assert!(!player.state.playback_started);
+        player.execute(Command::Play).unwrap();
+        smoke_wait(&mut player, "watched playback signal", |p| {
+            p.state.playback_started
+        });
+        player.execute(Command::Pause).unwrap();
+        player.refresh();
+        assert!(
+            player.state.playback_started,
+            "Started signal must survive pausing"
+        );
+        player.execute(Command::Load(path)).unwrap();
+        assert!(
+            !player.state.playback_started,
+            "New load must reset started signal"
+        );
     }
     #[test]
     fn empty_graph_disables_complex_filter() {

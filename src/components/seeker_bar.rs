@@ -42,6 +42,7 @@ impl SeekerBar {
     }
 
     pub fn set_media(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.previews.release();
         self.path = Some(path);
         self.generation += 1;
         self.thumbnail = None;
@@ -51,6 +52,13 @@ impl SeekerBar {
         self.position = 0.0;
         self.duration = 0.0;
         cx.notify();
+    }
+
+    pub fn release_previews(&mut self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.requested = None;
+        self.thumbnail = None;
+        self.hover = None;
+        self.previews.release()
     }
 
     pub fn sync(&mut self, position: f64, duration: f64, cx: &mut Context<Self>) {

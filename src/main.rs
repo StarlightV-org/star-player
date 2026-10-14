@@ -2,12 +2,14 @@
 
 use components::{
     audio_tracks::{AudioTracks, TrackGainEvent},
+    clip_browser::{BrowserEvent, ClipBrowser},
     media_controls::{MediaControls, MediaControlsEvent},
     seeker_bar::{SeekerBar, SeekerEvent},
     volume_controls::{VolumeControls, VolumeEvent},
 };
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::{
-    ActiveTheme as _, IconName,
+    ActiveTheme as _, IconName, TitleBar,
     button::{Button, ButtonVariants},
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -22,6 +24,8 @@ use std::{
 
 mod app_assets;
 mod app_icon;
+mod clip_library;
+mod clip_store;
 mod components;
 mod logging;
 mod media_keys;
@@ -43,6 +47,10 @@ fn render_image(mut pixels: image::RgbaImage) -> Arc<RenderImage> {
 }
 
 struct PlayerShell {
+    browser: Entity<ClipBrowser>,
+    navigation: Vec<PathBuf>,
+    played_recorded: bool,
+    hover_navigation: Option<bool>,
     playback: Option<Playback>,
     snapshot: Snapshot,
     native_video: Option<Rc<native_video::NativeVideo>>,
@@ -67,11 +75,33 @@ struct PlayerShell {
 
 impl PlayerShell {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let browser = cx.new(|cx| ClipBrowser::new(std::env::args_os().nth(1).is_none(), cx));
         let media_controls = cx.new(|_| MediaControls::default());
         let volume_controls = cx.new(VolumeControls::new);
         let seeker_bar = cx.new(|cx| SeekerBar::new(0.0, cx));
         let audio_tracks = cx.new(AudioTracks::new);
         let subscriptions = vec![
+            cx.subscribe_in(
+                &browser,
+                window,
+                |this, _, event: &BrowserEvent, window, cx| match event {
+                    BrowserEvent::Play(path, list) => {
+                        this.navigation = list.clone();
+                        this.load(path.clone(), cx);
+                        window.focus(&this.focus, cx);
+                    }
+                    BrowserEvent::Delete(paths) => {
+                        if this.path.as_ref().is_some_and(|path| paths.contains(path)) {
+                            this.back_to_library(window, cx);
+                        }
+                        let released = this
+                            .seeker_bar
+                            .update(cx, |seeker, _| seeker.release_previews());
+                        this.browser.read(cx).delete(paths.clone(), released);
+                    }
+                    BrowserEvent::Open => this.open(window, cx),
+                },
+            ),
             cx.subscribe_in(
                 &media_controls,
                 window,
@@ -153,6 +183,10 @@ impl PlayerShell {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let shell = Self {
+            browser,
+            navigation: vec![],
+            played_recorded: false,
+            hover_navigation: None,
             playback,
             snapshot: Snapshot::default(),
             native_video,
@@ -236,6 +270,8 @@ impl PlayerShell {
     }
 
     fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.played_recorded = false;
+        self.hover_navigation = None;
         if self.playback.is_none() {
             let Some(host) = &self.native_video else {
                 cx.notify();
@@ -271,6 +307,7 @@ impl PlayerShell {
             Ok(Ok(Some(paths))) => {
                 if let Some(path) = paths.into_iter().next() {
                     let _ = this.update_in(cx, |this, window, cx| {
+                        this.navigation.clear();
                         this.load(path, cx);
                         window.focus(&this.focus, cx);
                     });
@@ -288,8 +325,27 @@ impl PlayerShell {
     }
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.browser.update(cx, |browser, cx| {
+            browser.poll(self.path.is_none(), window, cx)
+        });
         if let Some(player) = &self.playback {
             self.snapshot = player.snapshot();
+        }
+        if !self.played_recorded
+            && self.path.is_some()
+            && self.snapshot.path == self.path
+            && self.snapshot.playback_started
+            && self.snapshot.error.is_none()
+        {
+            self.played_recorded = true;
+            self.browser.update(cx, |browser, _| {
+                browser.mark_played(self.path.clone().unwrap())
+            });
+        }
+        if self.path.is_some() && !self.navigation.is_empty() {
+            self.navigation.retain(|path| {
+                Some(path) == self.path.as_ref() || self.browser.read(cx).exists(path)
+            });
         }
         let snapshot = &self.snapshot;
         self.media_controls.update(cx, |controls, cx| {
@@ -327,6 +383,7 @@ impl PlayerShell {
         self.controls_visible = controls_should_show(
             self.path.is_none()
                 || self.snapshot.paused
+                || self.hover_navigation.is_some()
                 || self.error.is_some()
                 || self.snapshot.error.is_some(),
             self.controls_dragging,
@@ -354,6 +411,9 @@ impl PlayerShell {
             return;
         }
         if modifiers.control || modifiers.alt || modifiers.platform {
+            return;
+        }
+        if self.path.is_none() {
             return;
         }
         let command = match key {
@@ -433,10 +493,42 @@ impl PlayerShell {
         cx.stop_propagation();
         cx.notify();
     }
+
+    fn back_to_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.video_click.take();
+        drop(self.playback.take());
+        self.seeker_bar.update(cx, |seeker, _| {
+            seeker.release_previews();
+        });
+        if let Some(host) = &self.native_video {
+            host.hide();
+        }
+        self.path = None;
+        self.snapshot = Snapshot::default();
+        self.hover_navigation = None;
+        self.show_help = false;
+        self.show_tracks = false;
+        self.browser
+            .update(cx, |browser, cx| browser.focus(window, cx));
+        cx.notify();
+    }
+
+    fn adjacent(&self, next: bool) -> Option<PathBuf> {
+        let index = self
+            .navigation
+            .iter()
+            .position(|p| Some(p) == self.path.as_ref())?;
+        let index = if next {
+            index.checked_add(1)?
+        } else {
+            index.checked_sub(1)?
+        };
+        self.navigation.get(index).cloned()
+    }
 }
 
 impl Render for PlayerShell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let error = self.error.clone().or_else(|| self.snapshot.error.clone());
         let title = self
             .path
@@ -444,7 +536,7 @@ impl Render for PlayerShell {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Spacer".into());
-        div()
+        let content = div()
             .id("player")
             .relative()
             .size_full()
@@ -469,15 +561,20 @@ impl Render for PlayerShell {
                     .absolute()
                     .inset_0()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::click_video))
-                    .when_some(self.native_video.clone(), |area, host| {
-                        area.child(
-                            canvas(
-                                move |bounds, window, _| host.layout(bounds, window.scale_factor()),
-                                |_, _, _, _| {},
+                    .when_some(
+                        self.native_video.clone().filter(|_| self.path.is_some()),
+                        |area, host| {
+                            area.child(
+                                canvas(
+                                    move |bounds, window, _| {
+                                        host.layout(bounds, window.scale_factor())
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .size_full(),
                             )
-                            .size_full(),
-                        )
-                    }),
+                        },
+                    ),
             )
             .when(self.path.is_none(), |shell| {
                 shell.child(
@@ -486,39 +583,10 @@ impl Render for PlayerShell {
                         .inset_0()
                         .occlude()
                         .bg(cx.theme().background.opacity(1.0))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_3xl()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Spacer"),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Open a video or audio file"),
-                        )
-                        .child(
-                            Button::new("empty-open")
-                                .primary()
-                                .icon(IconName::FolderOpen)
-                                .label("Open a file")
-                                .on_click(cx.listener(|this, _, window, cx| this.open(window, cx))),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("or press Ctrl+O"),
-                        ),
+                        .child(self.browser.clone()),
                 )
             })
-            .when(self.controls_visible, |shell| {
+            .when(self.controls_visible && self.path.is_some(), |shell| {
                 shell
                     .child(
                         div()
@@ -564,6 +632,15 @@ impl Render for PlayerShell {
                                     .bg(cx.theme().background.opacity(0.85))
                                     .border_1()
                                     .border_color(cx.theme().border)
+                                    .child(
+                                        Button::new("back-library")
+                                            .ghost()
+                                            .icon(IconName::ChevronLeft)
+                                            .label("Library")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.back_to_library(window, cx)
+                                            })),
+                                    )
                                     .child(
                                         Button::new("open-media")
                                             .ghost()
@@ -656,6 +733,79 @@ impl Render for PlayerShell {
                                     ),
                             ),
                     )
+            })
+            .when(self.path.is_some() && self.controls_visible, |shell| {
+                let mut shell = shell;
+                for next in [false, true] {
+                    let target = self.adjacent(next);
+                    let hovered = self.hover_navigation == Some(next);
+                    let image = target.as_ref().and_then(|path| {
+                        self.browser
+                            .update(cx, |browser, _| browser.thumbnail(path))
+                    });
+                    shell = shell.child(
+                        div()
+                            .id(if next { "next-video" } else { "previous-video" })
+                            .absolute()
+                            .top(relative(0.45))
+                            .when(next, |s| s.right_4())
+                            .when(!next, |s| s.left_4())
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
+                            .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                                this.hover_navigation = if *hovering { Some(next) } else { None };
+                                this.reveal_controls(cx);
+                                cx.notify();
+                            }))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                Button::new(if next { "next-clip" } else { "previous-clip" })
+                                    .ghost()
+                                    .icon(if next {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronLeft
+                                    })
+                                    .disabled(target.is_none())
+                                    .label(if next { "Next" } else { "Previous" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(path) = this.adjacent(next) {
+                                            this.load(path, cx);
+                                        }
+                                    })),
+                            )
+                            .when(hovered, |s| {
+                                s.when_some(target, |s, path| {
+                                    s.child(
+                                        div()
+                                            .w(px(180.))
+                                            .p_2()
+                                            .rounded_md()
+                                            .bg(cx.theme().popover)
+                                            .when_some(image, |s, image| {
+                                                s.child(
+                                                    img(image)
+                                                        .w_full()
+                                                        .h(px(101.))
+                                                        .object_fit(ObjectFit::Contain),
+                                                )
+                                            })
+                                            .child(
+                                                div().text_xs().truncate().child(
+                                                    path.file_name()
+                                                        .unwrap_or_default()
+                                                        .to_string_lossy()
+                                                        .into_owned(),
+                                                ),
+                                            ),
+                                    )
+                                })
+                            }),
+                    );
+                }
+                shell
             })
             .when(self.controls_visible && self.show_tracks, |shell| {
                 shell.child(
@@ -785,7 +935,25 @@ impl Render for PlayerShell {
                         .text_sm()
                         .child(error),
                 )
+            });
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| this.reveal_controls(cx)))
+            .when(!window.is_fullscreen(), |shell| {
+                shell.child(
+                    TitleBar::new().bg(cx.theme().background).child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(img("spacer/icon.png").w(px(20.)).h(px(20.)))
+                            .child("Spacer"),
+                    ),
+                )
             })
+            .child(div().relative().flex_1().min_h_0().child(content))
     }
 }
 
@@ -826,7 +994,7 @@ fn main() {
             window_background: WindowBackgroundAppearance::Transparent,
             titlebar: Some(TitlebarOptions {
                 title: Some("Spacer".into()),
-                ..Default::default()
+                ..TitleBar::title_bar_options()
             }),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
@@ -834,7 +1002,7 @@ fn main() {
                 cx,
             ))),
             window_min_size: Some(size(px(680.0), px(480.0))),
-            ..Default::default()
+            ..TitleBar::window_options()
         };
         cx.open_window(options, |window, cx| {
             app_icon::apply(window);

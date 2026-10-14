@@ -33,6 +33,55 @@ cargo build --release
 
 Ship `target/release/spacer.exe`; no separate decoder files need to accompany it. For builds without network access, supply the same pinned `.7z` archive using the build-time `SPACER_MPV_ARCHIVE` environment variable. It must have the expected checksum. Cargo dependencies must also be available locally.
 
+## Local game clip library
+
+Launching without a file opens the clip library. On the first such launch,
+Spacer asks whether to detect NVIDIA Overlay recordings. Both acceptance and
+declining are saved in `%USERPROFILE%\.spacer\config.json`. Launching with a
+file skips the prompt. You can later use **Detect clips** or **Add folder**.
+
+Detection reads `%LOCALAPPDATA%\NVIDIA Corporation\NVIDIA Overlay\GallerySettings.json`
+and adds `settings.currentDirectoryV2` to the `clip_directories` array. Spacer
+does not change NVIDIA settings or move recordings. Missing settings or folders
+produce an error and leave manual folder selection available.
+
+Game folders keep their hierarchy and show the latest clip's filesystem creation
+time and a recursive clip count. Folders without clips anywhere in their hierarchy
+are hidden. Sort folders by newest clip, name, or clip count.
+Clips within each folder are newest first. Creation time falls back to modification
+time if unavailable. Folder icons are generic; game-icon lookup is deferred.
+
+Directories are watched recursively. A startup scan and periodic reconciliation
+also catch offline changes and reconnected drives. Directory links are not followed.
+Only recognized video extensions are listed; screenshots and audio-only files
+remain accessible through **Open file**. Thumbnails use the bundled decoder,
+load on demand, and cache in `.spacer/thumbnails`.
+
+Click a clip row without modifiers to open the separate player. Use the checkboxes
+to select clips, Ctrl-click to toggle selection, or Shift-click for a range.
+Ctrl+A selects the current folder's clips. Left/right edge buttons
+move through the original folder list; hover to preview the destination. Navigation
+does not wrap or cross folders. Deleted entries are skipped, and new recordings
+enter the list after returning to the library. **Library** restores the folder,
+selection, and scroll position.
+
+Playback beginning marks a clip watched. `.spacer/watched.csv` contains
+`sha256,watched_at` records with SHA-256 hashes of filenames and UTC timestamps.
+Watched checks do not read video contents or wait for thumbnails. Files with the
+same filename share watched status, even in different folders. Moving a file
+preserves its status; renaming it changes its identity. Existing content-hash
+records from earlier versions do not match the filename hashes.
+Bulk **Mark watched** and **Mark unwatched** update the same history.
+
+Bulk **Delete** and the Delete key ask for confirmation before moving clips to
+the Windows Recycle Bin. Failures are reported without permanently deleting files.
+Configuration and history updates use atomic replacement; malformed existing
+files are reported and not overwritten. Running multiple Spacer instances that
+edit the same configuration/history simultaneously is not supported.
+
+The Windows title bar is drawn by GPUI Kit with the Spacer icon/name and window
+controls. It is hidden in fullscreen; native video occupies the space below it.
+
 Pinned build:
 
 - Release: https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20261014
@@ -155,8 +204,9 @@ Main playback does not copy frames into GPUI images. The 100 ms UI timer updates
 controls, not video presentation. libmpv owns playback timing and synchronization.
 Only thumbnails and software-renderer tests use software render contexts.
 
-The video host fills the window's client area without padding or a reserved
-control strip. Video keeps its original aspect ratio; mismatched window sizes
+The video host fills the player area below the custom title bar without padding
+or a reserved control strip. It is hidden while browsing the library.
+Video keeps its original aspect ratio; mismatched window sizes
 can still have letterboxing. Compact translucent controls float over the video
 and disappear after three seconds of idle playback. Mouse movement or keyboard
 input brings them back. Controls stay visible while paused or dragging a slider.

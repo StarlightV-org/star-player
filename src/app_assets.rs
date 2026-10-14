@@ -9,6 +9,9 @@ pub struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path == "spacer/icon.png" {
+            return Ok(Some(Cow::Borrowed(include_bytes!("../assets/icon.png"))));
+        }
         if let Some(bytes) = SeekIcons.load(path)? {
             return Ok(Some(bytes));
         }
@@ -37,6 +40,7 @@ mod tests {
                 .is_some()
         );
         assert!(AppAssets.load("icons/play.svg").unwrap().is_some());
+        assert!(AppAssets.load("spacer/icon.png").unwrap().is_some());
         let paths = AppAssets.list("icons").unwrap();
         assert!(
             paths

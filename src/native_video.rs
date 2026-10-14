@@ -118,6 +118,20 @@ impl NativeVideo {
         );
     }
 
+    pub fn hide(&self) {
+        self.set_cursor_hidden(false);
+        self.geometry.set(None);
+        #[cfg(windows)]
+        if self.hwnd.get() != 0 {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    self.hwnd.get() as _,
+                    windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                );
+            }
+        }
+    }
+
     /// Only call after Playback has stopped and joined its worker.
     pub fn destroy(&self) {
         self.set_cursor_hidden(false);
