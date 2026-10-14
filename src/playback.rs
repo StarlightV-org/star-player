@@ -58,6 +58,31 @@ pub struct Diagnostic {
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_DIAGNOSTIC_CHARS: usize = 1024;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioOutputMode {
+    #[default]
+    Stereo,
+    System,
+    HeadsetCompatible,
+}
+
+impl AudioOutputMode {
+    fn channels(self) -> &'static str {
+        match self {
+            Self::Stereo => "stereo",
+            Self::System => "auto-safe",
+            Self::HeadsetCompatible => "stereo",
+        }
+    }
+
+    fn device(self) -> &'static str {
+        match self {
+            Self::HeadsetCompatible => "openal",
+            _ => "auto",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub duration: f64,
@@ -68,6 +93,7 @@ pub struct Snapshot {
     pub muted: bool,
     pub speed: f64,
     pub effective_muted: bool,
+    pub audio_output: AudioOutputMode,
     pub video_output: Option<String>,
     pub hardware_decoder: Option<String>,
     pub dropped_frames: Option<f64>,
@@ -92,6 +118,7 @@ impl Default for Snapshot {
             muted: false,
             speed: 1.0,
             effective_muted: true,
+            audio_output: AudioOutputMode::default(),
             video_output: None,
             hardware_decoder: None,
             dropped_frames: None,
@@ -179,6 +206,7 @@ pub enum Command {
     SetVolume(f64),
     SetMute(bool),
     SetSpeed(f64),
+    SetAudioOutput(AudioOutputMode),
     SetTrackGain {
         id: i64,
         gain: f64,
@@ -608,6 +636,11 @@ impl Player {
             ("mute", "yes"),
             ("volume", "100"),
             ("volume-max", "100"),
+            // Headsets can advertise virtual 7.1 even when the listener expects
+            // stereo. Downmix in mpv instead of relying on that device routing.
+            ("audio-channels", "stereo"),
+            ("audio-normalize-downmix", "yes"),
+            ("ad-lavc-downmix", "no"),
             ("input-default-bindings", "no"),
             ("osd-level", "0"),
         ] {
@@ -957,6 +990,37 @@ impl Player {
                 finite_range(value, 0.01, 100.0, "Speed")?;
                 self.set("speed", &value.to_string())
             }
+            Command::SetAudioOutput(mode) => {
+                if mode == AudioOutputMode::HeadsetCompatible {
+                    let devices = self.property_node("audio-device-list")?;
+                    if !devices
+                        .as_array()
+                        .is_some_and(|devices| devices.iter().any(|d| d["name"] == "openal"))
+                    {
+                        return Err(
+                            "Headset compatibility output is not available in this decoder build"
+                                .into(),
+                        );
+                    }
+                }
+                let previous = self.state.audio_output;
+                self.set("audio-channels", mode.channels())?;
+                if let Err(error) = self.set("audio-device", mode.device()) {
+                    let _ = self.set("audio-channels", previous.channels());
+                    return Err(error);
+                }
+                self.state.audio_output = mode;
+                Print(
+                    Level::Info,
+                    format!(
+                        "Audio routing {mode:?}: channels={}, source={:?}, output={:?}",
+                        mode.channels(),
+                        self.property_node("audio-params").ok(),
+                        self.property_node("audio-out-params").ok()
+                    ),
+                );
+                Ok(())
+            }
             Command::SetTrackGain { id, gain } => {
                 finite_range(gain, 0.0, 10.0, "Track gain")?;
                 let mut tracks = self.state.tracks.clone();
@@ -1004,6 +1068,17 @@ impl Player {
                         self.property_node("current-vo").ok(),
                         self.number("frame-drop-count"),
                         self.number("decoder-frame-drop-count")
+                    ),
+                );
+                Print(
+                    Level::Info,
+                    format!(
+                        "Audio device={:?} backend={:?} routing={:?} source={:?} output={:?}",
+                        self.property_node("audio-device").ok(),
+                        self.property_node("current-ao").ok(),
+                        self.state.audio_output,
+                        self.property_node("audio-params").ok(),
+                        self.property_node("audio-out-params").ok()
                     ),
                 );
                 stats_at = Instant::now();
@@ -1665,6 +1740,154 @@ pub(crate) mod test_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Probe a user-supplied file with the bundled decoder, without physical
+    /// playback or external tools. Both paths must be explicitly supplied.
+    #[test]
+    #[ignore = "requires SPACER_AUDIO_PROBE and SPACER_AUDIO_PROBE_OUTPUT"]
+    fn diagnose_audio_file() {
+        let path =
+            PathBuf::from(std::env::var_os("SPACER_AUDIO_PROBE").expect("Set SPACER_AUDIO_PROBE"));
+        let output = PathBuf::from(
+            std::env::var_os("SPACER_AUDIO_PROBE_OUTPUT").expect("Set SPACER_AUDIO_PROBE_OUTPUT"),
+        );
+        let mut player =
+            Player::new_with_options(Arc::new(Mailbox::new()), &[("ao", "null"), ("vid", "no")])
+                .unwrap();
+        player.execute(Command::Load(path)).unwrap();
+        smoke_wait(&mut player, "decoded audio", |p| {
+            p.media_ready && p.property_node("audio-out-params").is_ok()
+        });
+        let mut report = serde_json::Map::new();
+        for key in [
+            "track-list",
+            "audio-params",
+            "audio-out-params",
+            "audio-codec-name",
+            "audio-channels",
+            "audio-device-list",
+            "lavfi-complex",
+            "af",
+            "volume",
+            "speed",
+        ] {
+            report.insert(
+                key.into(),
+                player.property_node(key).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires explicit media/report paths; opens muted physical output"]
+    fn diagnose_headset_backends() {
+        let path =
+            PathBuf::from(std::env::var_os("SPACER_AUDIO_PROBE").expect("Set SPACER_AUDIO_PROBE"));
+        let output = PathBuf::from(
+            std::env::var_os("SPACER_AUDIO_PROBE_OUTPUT").expect("Set SPACER_AUDIO_PROBE_OUTPUT"),
+        );
+        let mut player =
+            Player::new_with_options(Arc::new(Mailbox::new()), &[("vid", "no")]).unwrap();
+        player.execute(Command::SetMute(true)).unwrap();
+        player.execute(Command::Load(path)).unwrap();
+        smoke_wait(&mut player, "muted native audio", |p| {
+            p.property_node("audio-out-params").is_ok()
+        });
+        let mut reports = Vec::new();
+        for mode in [AudioOutputMode::Stereo, AudioOutputMode::HeadsetCompatible] {
+            player.execute(Command::SetAudioOutput(mode)).unwrap();
+            smoke_wait(&mut player, "audio backend switch", |p| {
+                p.property_node("current-ao").ok().is_some_and(|v| {
+                    v == if mode == AudioOutputMode::HeadsetCompatible {
+                        "openal"
+                    } else {
+                        "wasapi"
+                    }
+                }) && p.property_node("audio-out-params").is_ok()
+            });
+            assert_eq!(player.flag("mute"), Some(true));
+            reports.push(serde_json::json!({
+                "mode": format!("{mode:?}"),
+                "backend": player.property_node("current-ao").ok(),
+                "source": player.property_node("audio-params").ok(),
+                "output": player.property_node("audio-out-params").ok(),
+                "device": player.property_node("audio-device").ok(),
+                "muted": player.flag("mute")
+            }));
+        }
+        std::fs::write(output, serde_json::to_vec_pretty(&reports).unwrap()).unwrap();
+    }
+    #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn surround_audio_downmixes_to_stereo_and_routing_preserves_controls() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("surround.wav");
+        // WAVEFORMATEXTENSIBLE PCM, FL/FR/FC/LFE/BL/BR. No external encoder.
+        let mut format = Vec::new();
+        for n in [0xfffe_u16, 6] {
+            format.extend(n.to_le_bytes());
+        }
+        for n in [48000_u32, 48000 * 12] {
+            format.extend(n.to_le_bytes());
+        }
+        for n in [12_u16, 16, 22, 16] {
+            format.extend(n.to_le_bytes());
+        }
+        format.extend(0x3f_u32.to_le_bytes());
+        format.extend([1, 0, 0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113]);
+        let mut samples = Vec::new();
+        for frame in 0..48000 * 4 {
+            for channel in 0..6 {
+                let frequency = if channel == 3 {
+                    80.0
+                } else {
+                    220.0 * (channel + 1) as f64
+                };
+                let value = (1000.0
+                    * (frame as f64 * frequency * std::f64::consts::TAU / 48000.0).sin())
+                    as i16;
+                samples.extend(value.to_le_bytes());
+            }
+        }
+        let mut data = b"WAVEfmt ".to_vec();
+        data.extend((format.len() as u32).to_le_bytes());
+        data.extend(format);
+        data.extend(b"data");
+        data.extend((samples.len() as u32).to_le_bytes());
+        data.extend(samples);
+        let mut file = b"RIFF".to_vec();
+        file.extend((data.len() as u32).to_le_bytes());
+        file.extend(data);
+        std::fs::write(&path, file).unwrap();
+
+        let mut player =
+            Player::new_with_options(Arc::new(Mailbox::new()), &[("ao", "null")]).unwrap();
+        player.execute(Command::Load(path)).unwrap();
+        smoke_wait(&mut player, "surround input and stereo output", |p| {
+            p.property_node("audio-params")
+                .ok()
+                .is_some_and(|v| v["channel-count"] == 6)
+                && p.property_node("audio-out-params")
+                    .ok()
+                    .is_some_and(|v| v["channel-count"] == 2)
+        });
+        assert_eq!(player.state.audio_output, AudioOutputMode::Stereo);
+        player.execute(Command::Pause).unwrap();
+        player.execute(Command::SetVolume(37.0)).unwrap();
+        let graph = player.property_node("lavfi-complex").unwrap();
+        for mode in [AudioOutputMode::System, AudioOutputMode::Stereo] {
+            player.execute(Command::SetAudioOutput(mode)).unwrap();
+            player.refresh();
+            assert_eq!(
+                player.property_node("audio-channels").unwrap().as_str(),
+                Some(mode.channels())
+            );
+            assert_eq!(player.state.audio_output, mode);
+            assert_eq!(player.property_node("lavfi-complex").unwrap(), graph);
+            assert_eq!(player.state.volume, 37.0);
+            assert!(player.intended_paused && player.state.effective_muted);
+        }
+    }
     #[test]
     fn preview_dimensions_preserve_aspect_and_bound_allocation() {
         assert_eq!(preview_size(1920, 1080), (240, 135));

@@ -100,20 +100,18 @@ impl Render for AudioTracks {
                     .flex()
                     .items_center()
                     .gap_3()
+                    .py_1()
                     .child(
                         div()
-                            .w(px(220.0))
+                            .w(px(112.0))
+                            .truncate()
                             .text_xs()
                             .text_color(if index == self.selected {
                                 cx.theme().primary
                             } else {
                                 cx.theme().muted_foreground
                             })
-                            .child(format!(
-                                "{} {}",
-                                if index == self.selected { ">" } else { " " },
-                                row.title
-                            )),
+                            .child(row.title.clone()),
                     )
                     .child(div().flex_1().child(Slider::new(&row.slider)))
                     .child(

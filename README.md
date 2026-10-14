@@ -47,6 +47,11 @@ Audio-only files are supported. Embedded audio tracks each have an independent g
 
 ## Controls
 
+Click the video to play or pause. Double-click it to maximize or restore the
+window. A double-click does not also toggle playback; single clicks wait for the
+Windows double-click interval. The fullscreen button and F still toggle actual
+fullscreen.
+
 | Action                           | Shortcut                      |
 | -------------------------------- | ----------------------------- |
 | Open media                       | Ctrl+O                        |
@@ -69,6 +74,7 @@ Audio-only files are supported. Embedded audio tracks each have an independent g
 | Fullscreen                       | F                             |
 | Show/hide shortcut help          | H or ?                        |
 | Hide shortcut help               | Escape                        |
+| Reload custom theme              | Ctrl+Shift+T                  |
 
 Hover over the timeline for a thumbnail and its requested timestamp. Click or drag to seek. A separate, silent decoder handles previews without changing playback position. Requests are debounced and superseded requests are canceled. Audio-only files have no thumbnail.
 
@@ -80,6 +86,73 @@ Logical pause always suppresses audio, including mpv's temporary resume during
 stepping. Explicit play restores the user's mute choice. Master volume and track
 gains remain unchanged.
 
+## Themes
+
+Spacer keeps the original dark plum and rose palette by default. On launch it
+creates `~/.spacer/theme.json` if that file does not exist. It never overwrites
+an existing theme. Edit this file to customize the colors, then press
+Ctrl+Shift+T to reload it or restart Spacer. Keep copies of alternative themes
+and copy the one you want to `theme.json`.
+
+Colors accept `#RRGGBB`, `#RRGGBBAA`, or OKLCH arrays with lightness, chroma,
+hue and optional alpha. The default file lists all supported color names.
+Partial themes inherit unspecified colors from the original palette:
+
+```json
+{
+  "name": "My theme",
+  "colors": {
+    "primary": "#be123c",
+    "primary_foreground": "#fff1f2",
+    "background": "#100b10",
+    "card": "#211821"
+  }
+}
+```
+
+Controls, floating panels, borders and thumbnails use these theme colors.
+Invalid themes fall back to the original palette without changing the file;
+the `Print` log reports the problem. Theme files are limited to 64 KiB.
+
+## Headset audio routing
+
+The default output is **Stereo**. mpv downmixes surround sources
+to stereo before handing them to Windows, rather than relying on a headset's
+advertised virtual surround layout. Downmix normalization is enabled to reduce
+clipping, and decoder-side downmixing is disabled so mpv handles the conversion.
+No EQ, bass boost or loudness effect is added. Track-mix gains remain independent.
+
+Use **System layout** in the audio mixer to follow the system's preferred
+channel layout instead. This choice lasts for the current session and switching
+it can briefly interrupt audio. Diagnostics report the audio backend, device,
+source channels and output channels.
+
+**Headset compatibility** is an opt-in alternative using the bundled OpenAL
+stereo output. It is intended for comparing headset-driver processing with the
+normal WASAPI route, not for adding bass boost or emulating Logitech DTS. Keep
+your desired G HUB effects enabled when comparing it. Switching routes can
+briefly interrupt audio. The normal route remains the default until listening
+tests establish whether this alternative helps your headset.
+
+Stereo routing is a workaround for a possible layout mismatch, not a confirmed
+diagnosis of the reported thin headset sound. Compare the same media in both
+modes and VLC. Windows spatial audio and vendor headset processing can still
+affect the result. The six-channel fixture test verifies stereo output and
+preservation of volume, gains and pause state, not perceptual equivalence to VLC.
+
+The subsequent [VLC comparison](docs/audio-comparison.md) found that the reported
+clip is already stereo and both players use the same Windows endpoint at full
+session volume. The user confirmed that disabling headset surround/spatial
+processing removed the difference, while making all applications sound flat.
+A surround downmix change cannot fix that source. The desired processed sound
+is not claimed as restored; the comparison document covers the compatibility
+route, vendor guidance and opt-in bundled-decoder probes.
+
+Floating controls, thumbnails, the mixer and help panels block pointer input
+from reaching the video behind them. Clicking a panel does not also play/pause
+or maximize the window. The seek buttons use the `rotate-ccw-clock` icon, mirrored
+for the forward direction and embedded alongside the default icons.
+
 ## Native video and diagnostics
 
 GPUI owns the controls and an application-owned child HWND. libmpv receives that
@@ -89,18 +162,26 @@ Main playback does not copy frames into GPUI images. The 100 ms UI timer updates
 controls, not video presentation. libmpv owns playback timing and synchronization.
 Only thumbnails and software-renderer tests use software render contexts.
 
-Native child windows cannot compose with GPUI overlays. Transport controls,
-errors, shortcut help and the reserved thumbnail area sit outside the video
-panel. The thumbnail area uses vertical space even when no preview is shown.
+The video host fills the window's client area without padding or a reserved
+control strip. Video keeps its original aspect ratio; mismatched window sizes
+can still have letterboxing. Compact translucent controls float over the video
+and disappear after three seconds of idle playback. Mouse movement or keyboard
+input brings them back. Controls stay visible while paused or dragging a slider.
+Open mixer and shortcut panels hide with the controls during idle playback and
+reappear on mouse movement or pause. The mixer button opens individual track
+sliders; thumbnails appear above the timeline without taking permanent space.
+
 The child cannot take input focus, so GPUI keeps keyboard control. Panel bounds
 use physical pixels calculated from GPUI layout and its display scale. Windows
 hides the child when its parent is minimized. Closing stops and joins playback
 before destroying the host; teardown services synchronous native messages.
 
-The GPUI window and its kit `Root` use transparent backgrounds. Only the video
-rectangle is left unpainted; header, gutters and controls remain opaque. This
-matters on Windows, where GPUI's DirectComposition layer can sit above child
-HWNDs. An opaque root hides the video even while audio and GPU output run.
+The GPUI window and its kit `Root` use transparent backgrounds. The main area
+stays unpainted; only floating UI paints translucent backgrounds. On the current
+Windows backend, GPUI's DirectComposition layer sits above child HWNDs and can
+display controls and thumbnails over native video without a texture bridge or
+additional native overlay window. An opaque root hides the video even while
+audio and GPU output run. Other GPUI backends need separate composition testing.
 
 Launching from an attached terminal enables the shared `Print` logger. Its
 bounded asynchronous queue drops excess messages rather than blocking playback.
@@ -142,7 +223,8 @@ Manual release checks still required:
   multiple tracks. Compare visible playback against dropped-frame logs.
 - Listen during repeated forward/backward steps, timeline dragging and resume.
 - Resize, fullscreen, multi-monitor DPI, minimize/restore, click focus and close.
-- Verify GPUI controls and thumbnails never cross the native video rectangle.
+- Verify floating controls, the mixer, shortcuts and thumbnails remain visible
+  above native video, including after fullscreen and DPI changes.
 - Check terminal output and run the packaged EXE offline on a machine with no
   installed mpv or ffmpeg.
 

@@ -64,17 +64,17 @@ impl Render for VolumeControls {
         div()
             .flex()
             .items_center()
-            .gap_3()
+            .gap_2()
             .child(
                 Button::new("mute")
                     .ghost()
-                    .label(if self.muted { "Unmute" } else { "Mute" })
+                    .label(if self.muted { "Muted" } else { "Sound" })
                     .tooltip("Mute / unmute (M)")
                     .on_click(
                         cx.listener(|this, _, _, cx| cx.emit(VolumeEvent::Mute(!this.muted))),
                     ),
             )
-            .child(div().w(px(112.0)).child(Slider::new(&self.state)))
+            .child(div().w(px(88.0)).child(Slider::new(&self.state)))
             .child(
                 div()
                     .w(px(36.0))

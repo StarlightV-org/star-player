@@ -132,14 +132,20 @@ impl Render for SeekerBar {
         let bounds = self.bounds.clone();
         let width = f32::from(self.bounds.get().size.width);
         let hover = self.hover;
-        // Reserve preview space outside the native video panel. Child HWNDs
-        // cannot be covered by a GPUI popup.
+        // The transparent GPUI composition layer hosts the preview above the
+        // native video. No permanently reserved thumbnail strip is needed.
         div()
             .flex()
-            .items_end()
-            .h(px(196.0))
-            .gap_4()
-            .child(div().w(px(60.0)).text_xs().child(timestamp(self.position)))
+            .items_center()
+            .h(px(24.0))
+            .gap_3()
+            .child(
+                div()
+                    .w(px(56.0))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(timestamp(self.position)),
+            )
             .child(
                 div()
                     .id("seek-track")
@@ -181,7 +187,7 @@ impl Render for SeekerBar {
                         div()
                             .absolute()
                             .top(px(10.0))
-                            .h(px(4.0))
+                            .h(px(3.0))
                             .w_full()
                             .rounded_full()
                             .bg(cx.theme().muted),
@@ -190,7 +196,7 @@ impl Render for SeekerBar {
                         div()
                             .absolute()
                             .top(px(10.0))
-                            .h(px(4.0))
+                            .h(px(3.0))
                             .w(relative(fraction))
                             .rounded_full()
                             .bg(cx.theme().primary),
@@ -201,12 +207,18 @@ impl Render for SeekerBar {
                         bar.child(
                             div()
                                 .absolute()
-                                .bottom(px(32.0))
+                                .bottom(px(38.0))
                                 .left(px(left))
                                 .w(px(240.0))
+                                .occlude()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                )
                                 .rounded_lg()
                                 .overflow_hidden()
-                                .bg(cx.theme().background)
+                                .bg(cx.theme().popover.opacity(0.96))
+                                .shadow_lg()
                                 .border_1()
                                 .border_color(cx.theme().border)
                                 .when_some(self.thumbnail.clone(), |popup, image| {
@@ -238,7 +250,7 @@ impl Render for SeekerBar {
             )
             .child(
                 div()
-                    .w(px(60.0))
+                    .w(px(56.0))
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(timestamp(self.duration)),
