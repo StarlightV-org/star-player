@@ -5,6 +5,4 @@
 - [x] exit fullscreen, if the player is not visible
 - [x] Deselect selected items on the list view if "escape" is pressed
 
-## ignore for now
-
-- [ ] Icons for the game folders
+- [x] Offline Steam icons for game folders, with approval and manual overrides

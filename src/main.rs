@@ -28,6 +28,7 @@ mod clip_library;
 mod clip_store;
 mod components;
 mod file_info;
+mod game_icons;
 mod logging;
 mod media_keys;
 mod native_backdrop;
@@ -37,6 +38,7 @@ mod notifications;
 mod playback;
 mod preview;
 mod runtime;
+mod steam_games;
 mod theme;
 mod thumbnail_cache;
 #[cfg(all(test, windows))]

@@ -19,7 +19,7 @@ raw-window-handle = "0.6"
 tempfile = "3"
 sha2 = "0.10"
 dirs = "6"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico"] }
 
 [build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -29,7 +29,7 @@ sha2 = "0.10"
 sevenz-rust2 = "0.24"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Threading", "Win32_System_Console", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Threading", "Win32_System_Console", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Registry"] }
 
 
 [profile.release]

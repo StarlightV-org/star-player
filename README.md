@@ -55,7 +55,39 @@ Game folders keep their hierarchy and show the latest clip's filesystem creation
 time and a recursive clip count. Folders without clips anywhere in their hierarchy
 are hidden. Sort folders by newest clip, name, or clip count.
 Clips within each folder are newest first. Creation time falls back to modification
-time if unavailable. Folder icons are generic; game-icon lookup is deferred.
+time if unavailable.
+
+### Offline Steam game icons
+
+Use **Detect Steam icons…** in the library, or **Detect Steam game icons…**
+in Settings. Every scan requires confirmation. Spacer reads local Steam
+installation metadata, game manifests across Steam libraries, cached artwork,
+and Steam `.url` shortcuts on the desktop and in the Start menu. It makes no
+network requests, launches no games, and never changes Steam files. There are
+no automatic Steam scans at startup. If Steam cannot be located, use
+**Choose Steam folder…** in Settings; the scan still requires confirmation.
+
+Unique folder-name matches receive an icon automatically. Matching ignores
+case, whitespace, and punctuation, but does not use fuzzy search. Automatic
+matching applies only to folders directly beneath a configured recording root.
+Nested folders keep their normal folder icon unless assigned manually. Games
+without usable local artwork also keep the normal icon.
+
+Right-click a folder for **Set custom icon…**, **Choose game icon…**, or
+**Restore assigned icon**. Custom images support PNG, JPEG, and ICO, up to
+16 MB and 4096 pixels per dimension. The searchable game picker includes
+previously detected games, even after uninstalling them. Manual overrides
+survive rescans. Restoring clears the override and shows the automatic icon,
+or the normal folder icon if no automatic match exists.
+
+Icons are normalized to PNG and copied into `.spacer/game-icons/images`.
+Steam ICO files containing RGB or indexed PNG frames are converted to RGBA.
+`catalog.json` stores discovered Steam games and `folders.json` stores folder
+assignments by absolute path. These icons do not count toward the thumbnail
+cache limit and remain after a game or the original custom image is removed.
+Missing or damaged images fall back to the normal folder icon. A fresh scan
+can repair an installed game's icon. Malformed icon JSON files are reported
+and not overwritten. Moving a recording folder changes its assignment key.
 
 Directories are watched recursively. A startup scan and periodic reconciliation
 also catch offline changes and reconnected drives. Directory links are not followed.

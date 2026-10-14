@@ -1,14 +1,16 @@
 use crate::{
     clip_library::{Catalog, Clip, Event, LibraryWorker, Request, Stamp},
     clip_store::{Config, Discovery, History},
+    game_icons::{self, Request as IconRequest},
 };
 use gpui_kit::{
-    base::{Selectable, VirtualListScrollHandle, v_virtual_list},
+    base::{Disableable, Selectable, VirtualListScrollHandle, v_virtual_list},
     component::{
-        ActiveTheme as _, Icon, IconName, WindowExt,
+        ActiveTheme as _, Icon, IconName, IndexPath, WindowExt,
         button::{Button, ButtonVariants},
         checkbox::Checkbox,
         input::{Input, InputEvent, InputState},
+        list::{List, ListDelegate, ListEvent, ListItem, ListState},
         menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
     },
     prelude::FluentBuilder as _,
@@ -58,6 +60,13 @@ enum Row {
 
 pub struct ClipBrowser {
     worker: LibraryWorker,
+    icon_worker: game_icons::Worker,
+    icons: game_icons::State,
+    icon_images: HashMap<String, Option<Arc<RenderImage>>>,
+    icon_requested: HashSet<String>,
+    detecting_icons: bool,
+    icon_picker_subscription: Option<Subscription>,
+    icon_picker_observer: Option<Subscription>,
     config: Config,
     catalog: Catalog,
     history: History,
@@ -83,11 +92,16 @@ impl EventEmitter<BrowserEvent> for ClipBrowser {}
 
 impl ClipBrowser {
     pub fn new(prompt_on_start: bool, cx: &mut Context<Self>) -> Self {
-        Self::with_worker(prompt_on_start, LibraryWorker::new(), cx)
+        Self::with_worker(prompt_on_start, LibraryWorker::new(), None, cx)
     }
     #[cfg(test)]
     pub fn for_test(directory: PathBuf, cx: &mut Context<Self>) -> Self {
-        Self::with_worker(false, LibraryWorker::for_test(directory), cx)
+        Self::with_worker(
+            false,
+            LibraryWorker::for_test(directory.clone()),
+            Some(directory),
+            cx,
+        )
     }
     #[cfg(test)]
     pub fn test_navigate(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
@@ -105,9 +119,21 @@ impl ClipBrowser {
     pub fn test_selection_empty(&self) -> bool {
         self.selected.is_empty() && self.anchor.is_none()
     }
-    fn with_worker(prompt_on_start: bool, worker: LibraryWorker, cx: &mut Context<Self>) -> Self {
+    fn with_worker(
+        prompt_on_start: bool,
+        worker: LibraryWorker,
+        directory: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             worker,
+            icon_worker: game_icons::Worker::new(directory),
+            icons: game_icons::State::default(),
+            icon_images: HashMap::new(),
+            icon_requested: HashSet::new(),
+            detecting_icons: false,
+            icon_picker_subscription: None,
+            icon_picker_observer: None,
             config: Config::default(),
             catalog: Catalog::default(),
             history: History::new(),
@@ -132,6 +158,38 @@ impl ClipBrowser {
     }
 
     pub fn poll(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        for event in self.icon_worker.events().collect::<Vec<_>>() {
+            match event {
+                game_icons::Event::State(state) => {
+                    self.icons = state;
+                    // A rescan may repair missing images with the same content hash.
+                    self.icon_images.retain(|_, image| image.is_some());
+                    self.icon_requested
+                        .retain(|hash| self.icon_images.contains_key(hash));
+                }
+                game_icons::Event::Image(hash, pixels) => {
+                    if self.icon_images.len() >= 256
+                        && let Some(key) = self.icon_images.keys().next().cloned()
+                    {
+                        self.icon_images.remove(&key);
+                        self.icon_requested.remove(&key);
+                    }
+                    self.icon_images
+                        .insert(hash, pixels.map(crate::render_image));
+                }
+                game_icons::Event::Detected(message) => {
+                    self.detecting_icons = false;
+                    window.open_alert_dialog(cx, move |alert, _, _| {
+                        alert.title("Steam game icons").description(message.clone())
+                    });
+                }
+                game_icons::Event::Error(error) => {
+                    self.detecting_icons = false;
+                    cx.emit(BrowserEvent::Error(error));
+                }
+            }
+            cx.notify();
+        }
         let events = self.worker.events().collect::<Vec<_>>();
         for event in events {
             match event {
@@ -317,6 +375,19 @@ impl ClipBrowser {
         }
         self.rows = rows;
         self.row_sizes = Rc::new(vec![size(px(300.), px(88.)); self.rows.len()]);
+        self.icon_worker.send(IconRequest::Folders(
+            self.catalog
+                .folders
+                .iter()
+                .filter(|path| {
+                    self.config
+                        .clip_directories
+                        .iter()
+                        .any(|root| path.parent() == Some(root.as_path()))
+                })
+                .cloned()
+                .collect(),
+        ));
     }
 
     fn navigate(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
@@ -643,6 +714,13 @@ impl ClipBrowser {
         match self.rows[index].clone() {
             Row::Folder(path, count, latest) => {
                 let label = name(&path);
+                let image = self
+                    .icons
+                    .image(&path)
+                    .map(str::to_owned)
+                    .and_then(|hash| self.icon_image(&hash));
+                let menu_path = path.clone();
+                let owner = cx.entity();
                 let subtitle = format!(
                     "Latest {} · {} clips",
                     latest.map(date).unwrap_or_else(|| "none".into()),
@@ -660,7 +738,21 @@ impl ClipBrowser {
                     .border_color(cx.theme().border)
                     .hover(|s| s.bg(cx.theme().muted))
                     .cursor_pointer()
-                    .child(Icon::new(IconName::FolderOpen).size(px(28.)))
+                    .child(
+                        div()
+                            .w(px(40.))
+                            .h(px(40.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when_some(image.clone(), |s, image| {
+                                s.child(img(image).size_full().object_fit(ObjectFit::Contain))
+                            })
+                            .when(image.is_none(), |s| {
+                                s.child(Icon::new(IconName::FolderOpen).size(px(28.)))
+                            }),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -677,6 +769,39 @@ impl ClipBrowser {
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.navigate(Some(path.clone()), cx)),
                     )
+                    .context_menu(move |menu, _, cx| {
+                        let restore = owner.read(cx).icons.has_override(&menu_path);
+                        let custom_owner = owner.clone();
+                        let choose_owner = owner.clone();
+                        let restore_owner = owner.clone();
+                        let custom_path = menu_path.clone();
+                        let choose_path = menu_path.clone();
+                        let restore_path = menu_path.clone();
+                        menu.item(PopupMenuItem::new("Set custom icon…").on_click(
+                            move |_, window, cx| {
+                                custom_owner.update(cx, |this, cx| {
+                                    this.custom_icon(custom_path.clone(), window, cx)
+                                });
+                            },
+                        ))
+                        .item(PopupMenuItem::new("Choose game icon…").on_click(
+                            move |_, window, cx| {
+                                choose_owner.update(cx, |this, cx| {
+                                    this.choose_game_icon(choose_path.clone(), window, cx)
+                                });
+                            },
+                        ))
+                        .item(
+                            PopupMenuItem::new("Restore assigned icon")
+                                .disabled(!restore)
+                                .on_click(move |_, _, cx| {
+                                    restore_owner.update(cx, |this, _| {
+                                        this.icon_worker
+                                            .send(IconRequest::Restore(restore_path.clone()))
+                                    });
+                                }),
+                        )
+                    })
                     .into_any_element()
             }
             Row::Clip(clip) => {
@@ -939,6 +1064,19 @@ impl Render for ClipBrowser {
                             .ghost()
                             .label("Open file")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserEvent::Open))),
+                    )
+                    .child(
+                        Button::new("library-steam-icons")
+                            .ghost()
+                            .label(if self.detecting_icons {
+                                "Detecting icons…"
+                            } else {
+                                "Detect Steam icons…"
+                            })
+                            .disabled(self.detecting_icons)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.approve_steam_scan(None, window, cx)
+                            })),
                     ),
             )
             .child(
@@ -1080,6 +1218,164 @@ impl Render for ClipBrowser {
 }
 
 impl ClipBrowser {
+    fn icon_image(&mut self, hash: &str) -> Option<Arc<RenderImage>> {
+        if self.icon_requested.insert(hash.to_owned()) {
+            self.icon_worker.send(IconRequest::Image(hash.to_owned()));
+        }
+        self.icon_images.get(hash).and_then(Clone::clone)
+    }
+
+    fn approve_steam_scan(
+        &self,
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.detecting_icons {
+            return;
+        }
+        let owner = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let owner = owner.clone();
+            let root = root.clone();
+            alert.title("Detect Steam game icons?")
+                .description("Spacer will read local Steam game metadata, cached artwork, and Steam shortcuts on your desktop and Start menu. Available icons will be copied into .spacer. No network requests are made and Steam files are not changed. Cached icons remain after uninstalling games.")
+                .confirm().ok_text("Detect icons").cancel_text("Not now")
+                .on_ok(move |_, _, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        if !this.detecting_icons {
+                            this.detecting_icons = true;
+                            this.icon_worker.send(IconRequest::Detect(root.clone()));
+                            cx.notify();
+                        }
+                    });
+                    true
+                })
+        });
+    }
+
+    fn select_steam_folder(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose Steam installation folder".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| match selection.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.approve_steam_scan(Some(path), window, cx)
+                    });
+                }
+            }
+            Ok(Err(error)) => {
+                let _ = this.update_in(cx, |_, _, cx| {
+                    cx.emit(BrowserEvent::Error(error.to_string()))
+                });
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
+    fn custom_icon(&self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a PNG, JPEG, or ICO image".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| match selection.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update_in(cx, |this, _, _| {
+                        this.icon_worker.send(IconRequest::Custom(folder, path))
+                    });
+                }
+            }
+            Ok(Err(error)) => {
+                let _ = this.update_in(cx, |_, _, cx| {
+                    cx.emit(BrowserEvent::Error(error.to_string()))
+                });
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
+    fn choose_game_icon(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let mut games = self
+            .icons
+            .games
+            .iter()
+            .filter_map(|(&id, game)| Some((id, game.name.clone(), game.image.clone()?)))
+            .collect::<Vec<_>>();
+        games.sort_by(|a, b| {
+            a.1.to_lowercase()
+                .cmp(&b.1.to_lowercase())
+                .then(a.0.cmp(&b.0))
+        });
+        let owner = cx.entity();
+        let weak = cx.weak_entity();
+        let list = cx.new(|cx| {
+            ListState::new(
+                GameIconPicker {
+                    filtered: games.clone(),
+                    games,
+                    selected: None,
+                    owner: weak,
+                },
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        self.icon_picker_observer =
+            Some(list.update(cx, |_, cx| cx.observe(&owner, |_, _, cx| cx.notify())));
+        self.icon_picker_subscription = Some(cx.subscribe_in(
+            &list,
+            window,
+            move |this, list, event, window, cx| {
+                match event {
+                    ListEvent::Confirm(index) => {
+                        if let Some((id, _, hash)) =
+                            list.read(cx).delegate().filtered.get(index.row)
+                            && this
+                                .icon_images
+                                .get(hash)
+                                .is_some_and(|image| image.is_some())
+                        {
+                            this.icon_worker
+                                .send(IconRequest::Choose(folder.clone(), *id));
+                            window.close_dialog(cx);
+                        }
+                    }
+                    ListEvent::Cancel => window.close_dialog(cx),
+                    _ => {}
+                }
+            },
+        ));
+        let initial_focus = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if initial_focus.replace(false) {
+                list.focus_handle(cx).focus(window, cx);
+            }
+            dialog.title("Choose game icon").w(px(520.)).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div().text_sm().child(
+                            "Cached Steam icons remain available after uninstalling a game.",
+                        ),
+                    )
+                    .child(List::new(&list).h(px(360.))),
+            )
+        });
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let enabled = self.config.clip_discovery == Discovery::Enabled;
         div().id("settings-page").size_full().overflow_y_scroll().p_6().flex().flex_col().gap_4()
@@ -1114,6 +1410,15 @@ impl ClipBrowser {
                     .on_click(cx.listener(|this, _, _, _| this.worker.send(Request::Detect)))))
             .child(div().text_xs().text_color(cx.theme().muted_foreground)
                 .child(if enabled { "Enabled. NVIDIA's current folder may be added again if removed." } else { "Disabled. Manual detection is still available." }))
+            .child(div().mt_4().text_lg().child("Steam game icons"))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Offline and manual. Every scan requires approval. Icons are kept in .spacer after games are uninstalled. Right-click a game folder to customize or restore its icon."))
+            .child(div().flex().items_center().gap_3()
+                .child(Button::new("detect-steam-icons").ghost().label(if self.detecting_icons { "Detecting…" } else { "Detect Steam game icons…" })
+                    .disabled(self.detecting_icons).on_click(cx.listener(|this, _, window, cx| this.approve_steam_scan(None, window, cx))))
+                .child(Button::new("choose-steam-folder").ghost().label("Choose Steam folder…")
+                    .disabled(self.detecting_icons).on_click(cx.listener(|this, _, window, cx| this.select_steam_folder(window, cx)))))
+            .child(format!("{} games with cached icons", self.icons.games.values().filter(|g| g.image.is_some()).count()))
             .child(div().mt_4().text_lg().child("Keyboard shortcuts"))
             .children(crate::PLAYER_SHORTCUTS.iter().map(|(action, shortcut)| {
                 div().flex().justify_between().max_w(px(600.)).text_sm().gap_4()
@@ -1121,6 +1426,91 @@ impl ClipBrowser {
             }))
             .child(div().mt_4().text_lg().child("About"))
             .child(format!("Spacer {} · Embedded libmpv", env!("CARGO_PKG_VERSION")))
+    }
+}
+
+struct GameIconPicker {
+    games: Vec<(u32, String, String)>,
+    filtered: Vec<(u32, String, String)>,
+    selected: Option<IndexPath>,
+    owner: WeakEntity<ClipBrowser>,
+}
+impl ListDelegate for GameIconPicker {
+    type Item = ListItem;
+    fn items_count(&self, _: usize, _: &App) -> usize {
+        self.filtered.len()
+    }
+    fn render_item(
+        &mut self,
+        index: IndexPath,
+        _: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> Option<ListItem> {
+        let (_, name, hash) = self.filtered.get(index.row)?;
+        let image = self
+            .owner
+            .update(cx, |owner, _| owner.icon_image(hash))
+            .ok()
+            .flatten();
+        Some(
+            ListItem::new(index)
+                .selected(self.selected == Some(index))
+                .disabled(image.is_none())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(div().w(px(32.)).h(px(32.)).flex_shrink_0().when_some(
+                            image.clone(),
+                            |s, image| {
+                                s.child(img(image).size_full().object_fit(ObjectFit::Contain))
+                            },
+                        ))
+                        .child(name.clone())
+                        .when(image.is_none(), |s| {
+                            s.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Loading or unavailable"),
+                            )
+                        }),
+                ),
+        )
+    }
+    fn set_selected_index(
+        &mut self,
+        index: Option<IndexPath>,
+        _: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) {
+        self.selected = index;
+        cx.notify();
+    }
+    fn perform_search(
+        &mut self,
+        query: &str,
+        _: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> Task<()> {
+        let query = query.to_lowercase();
+        self.filtered = self
+            .games
+            .iter()
+            .filter(|(_, name, _)| name.to_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        self.selected = None;
+        cx.notify();
+        Task::ready(())
+    }
+    fn render_empty(
+        &mut self,
+        _: &mut Window,
+        _: &mut Context<ListState<Self>>,
+    ) -> impl IntoElement {
+        div().p_4().child("No cached game icons found. Run Detect Steam game icons in Settings, or choose a custom image.")
     }
 }
 
