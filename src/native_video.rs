@@ -8,6 +8,8 @@ pub struct NativeVideo {
     geometry: Cell<Option<([i32; 4], f32)>>,
     #[cfg(windows)]
     cursor: crate::window_cursor::WindowCursor,
+    #[cfg(windows)]
+    _backdrop: crate::native_backdrop::NativeBackdrop,
     // Prevent moving this owner off the window's UI thread.
     _ui_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -16,41 +18,17 @@ impl NativeVideo {
     #[cfg(windows)]
     pub fn new(window: &Window) -> Result<Self, String> {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        use windows_sys::Win32::UI::WindowsAndMessaging::*;
-        // Public Win32 static-control style, not exposed by windows-sys.
-        const SS_BLACKRECT: u32 = 0x00000004;
         let RawWindowHandle::Win32(parent) = HasWindowHandle::window_handle(window)
             .map_err(|e| e.to_string())?
             .as_raw()
         else {
             return Err("GPUI did not provide a Windows HWND".into());
         };
-        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
         let cursor = crate::window_cursor::WindowCursor::new(parent.hwnd.get() as _)?;
+        let backdrop = crate::native_backdrop::NativeBackdrop::new(parent.hwnd.get() as _)?;
         // Disabled children do not take mouse/keyboard input. Clicks hit GPUI's
         // parent panel instead, even when mpv creates its own nested VO window.
-        let hwnd = unsafe {
-            CreateWindowExW(
-                0,
-                class.as_ptr(),
-                std::ptr::null(),
-                WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_DISABLED | SS_BLACKRECT,
-                0,
-                0,
-                1,
-                1,
-                parent.hwnd.get() as _,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if hwnd.is_null() {
-            return Err(format!(
-                "Create video panel: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        let hwnd = backdrop.create_video_host()?;
         Print(
             Level::Info,
             format!("Created native video panel HWND={hwnd:p}"),
@@ -59,6 +37,7 @@ impl NativeVideo {
             hwnd: Cell::new(hwnd as usize),
             geometry: Cell::new(None),
             cursor,
+            _backdrop: backdrop,
             _ui_thread: std::marker::PhantomData,
         })
     }
@@ -70,6 +49,13 @@ impl NativeVideo {
 
     pub fn hwnd(&self) -> usize {
         self.hwnd.get()
+    }
+
+    #[cfg(all(test, windows))]
+    pub fn backdrop_size(&self) -> [i32; 2] {
+        let mut rect = unsafe { std::mem::zeroed() };
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(self._backdrop.hwnd(), &mut rect); }
+        [rect.right, rect.bottom]
     }
 
     pub fn set_cursor_hidden(&self, hidden: bool) {
@@ -212,6 +198,7 @@ mod tests {
             }
         }
         let _parent = Parent(parent);
+        let backdrop = crate::native_backdrop::NativeBackdrop::new(parent).unwrap();
         let child = unsafe {
             CreateWindowExW(
                 0,
@@ -222,7 +209,7 @@ mod tests {
                 0,
                 320,
                 240,
-                parent,
+                backdrop.hwnd(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null(),
@@ -233,6 +220,7 @@ mod tests {
             hwnd: Cell::new(child as usize),
             geometry: Cell::new(None),
             cursor: crate::window_cursor::WindowCursor::new(parent).unwrap(),
+            _backdrop: backdrop,
             _ui_thread: std::marker::PhantomData,
         };
         let player = Playback::native(host.hwnd()).unwrap();

@@ -65,6 +65,11 @@ does not wrap or cross folders. Deleted entries are skipped, and new recordings
 enter the list after returning to the library. **Library** restores the folder,
 selection, and scroll position.
 
+Files opened with **Open file**, Ctrl+O, or a command-line path also support
+Previous/Next. Their queue contains videos in the same directory, sorted by
+filename, without scanning subdirectories or adding the directory to the library.
+Each edge button appears only when the cursor is near it and a destination exists.
+
 Playback beginning marks a clip watched. `.spacer/watched.csv` contains
 `sha256,watched_at` records with SHA-256 hashes of filenames and UTC timestamps.
 Watched checks do not read video contents or wait for thumbnails. Files with the
@@ -101,6 +106,10 @@ window. A double-click does not also toggle playback; single clicks wait for the
 Windows double-click interval. The fullscreen button and F still toggle actual
 fullscreen.
 
+The mouse's Back/Forward side buttons retrace visited library and video views,
+like browser history. Opening another video after going Back clears the forward
+history. These buttons do not seek or step through the folder's video list.
+
 | Action                           | Shortcut                      |
 | -------------------------------- | ----------------------------- |
 | Open media                       | Ctrl+O                        |
@@ -127,7 +136,7 @@ fullscreen.
 
 Hover over the timeline for a thumbnail and its requested timestamp. Click or drag to seek. A separate, silent decoder handles previews without changing playback position. Requests are debounced and superseded requests are canceled. Audio-only files have no thumbnail.
 
-On Windows, media play/pause, stop, previous, and next keys work while Spacer is the foreground application. Previous/next seek by 10 seconds because there is no playlist. Windows system volume keys keep their normal behavior. Background media-session integration is not implemented.
+On Windows, media play/pause, stop, previous, and next keys work while Spacer is the foreground application. Previous/next media keys seek by 10 seconds. Windows system volume keys keep their normal behavior. Background media-session integration is not implemented.
 
 Frame stepping uses mpv's frame commands rather than an assumed frame rate. Backward stepping can be slower because the decoder must seek and reconstruct preceding frames.
 
@@ -219,13 +228,18 @@ use physical pixels calculated from GPUI layout and its display scale. Windows
 hides the child when its parent is minimized. Closing stops and joins playback
 before destroying the host; teardown services synchronous native messages.
 
-The GPUI window and its kit `Root` use transparent backgrounds. The main area
-stays unpainted during playback; the empty startup screen paints an opaque theme
-background. Floating UI paints translucent backgrounds. On the current
-Windows backend, GPUI's DirectComposition layer sits above child HWNDs and can
-display controls and thumbnails over native video without a texture bridge or
-additional native overlay window. An opaque root hides the video even while
-audio and GPU output run. Other GPUI backends need separate composition testing.
+The window uses three layers: a permanent opaque black native background, native
+video nested inside that background, and GPUI controls/library above both.
+The background has its own redirected bitmap at full opacity and resizes with
+the Windows client area before the next GPUI frame. It stays visible during file
+replacement, decoder startup/shutdown, and returning to the library.
+
+The GPUI window and its kit `Root` remain transparent so they do not cover native
+video. The library paints an opaque theme background above the native backing;
+floating controls paint translucent backgrounds. On the current Windows backend,
+GPUI's DirectComposition layer displays controls and thumbnails above the native
+children without copying video frames. An opaque GPUI root would hide the video.
+Other GPUI backends need separate composition testing.
 
 Release builds use the Windows GUI subsystem and do not open a console when
 launched from Explorer. They reuse the parent's terminal when one is available.
@@ -249,6 +263,7 @@ cargo test
 cargo fmt -- --check
 cargo test software_60fps_render_throughput -- --ignored
 cargo test native_gpu_playback_steps_and_60fps_throughput -- --ignored
+cargo test opaque_background_survives_video_transitions -- --ignored
 ```
 
 Tests exercise the actual embedded decoder using video/audio fixtures written in Rust. No ffmpeg or system-installed decoder is needed for the tests. They cover software-rendered frame pixels, paused forward/backward stepping, simultaneous audio-track selection and gain configuration, seek and file-replacement races, preview decoding and cancellation, and extraction integrity. Audio tests use null output; physical-device output and audible mix quality still need listening tests.

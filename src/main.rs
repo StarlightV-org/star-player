@@ -7,7 +7,6 @@ use components::{
     seeker_bar::{SeekerBar, SeekerEvent},
     volume_controls::{VolumeControls, VolumeEvent},
 };
-use gpui_kit::base::Disableable as _;
 use gpui_kit::component::{
     ActiveTheme as _, IconName, TitleBar,
     button::{Button, ButtonVariants},
@@ -29,7 +28,9 @@ mod clip_store;
 mod components;
 mod logging;
 mod media_keys;
+mod native_backdrop;
 mod native_video;
+mod navigation;
 mod playback;
 mod preview;
 mod runtime;
@@ -46,9 +47,18 @@ fn render_image(mut pixels: image::RgbaImage) -> Arc<RenderImage> {
     )]))
 }
 
+struct NavigationView {
+    path: Option<PathBuf>,
+    queue: Vec<PathBuf>,
+    folder: bool,
+}
+
 struct PlayerShell {
     browser: Entity<ClipBrowser>,
     navigation: Vec<PathBuf>,
+    folder_navigation: bool,
+    navigation_scan: Option<Task<()>>,
+    history: navigation::History<NavigationView>,
     played_recorded: bool,
     hover_navigation: Option<bool>,
     playback: Option<Playback>,
@@ -86,8 +96,11 @@ impl PlayerShell {
                 window,
                 |this, _, event: &BrowserEvent, window, cx| match event {
                     BrowserEvent::Play(path, list) => {
+                        this.remember_view(Some(path));
+                        this.navigation_scan.take();
+                        this.folder_navigation = false;
                         this.navigation = list.clone();
-                        this.load(path.clone(), cx);
+                        this.load_media(path.clone(), cx);
                         window.focus(&this.focus, cx);
                     }
                     BrowserEvent::Delete(paths) => {
@@ -185,6 +198,9 @@ impl PlayerShell {
         let shell = Self {
             browser,
             navigation: vec![],
+            folder_navigation: false,
+            navigation_scan: None,
+            history: navigation::History::default(),
             played_recorded: false,
             hover_navigation: None,
             playback,
@@ -234,6 +250,7 @@ impl PlayerShell {
     }
 
     fn shutdown(&mut self) {
+        self.navigation_scan.take();
         self.video_click.take();
         drop(self.playback.take());
         if let Some(host) = self.native_video.take() {
@@ -270,6 +287,11 @@ impl PlayerShell {
     }
 
     fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.remember_view(Some(&path));
+        self.load_media(path, cx);
+    }
+
+    fn load_media(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.played_recorded = false;
         self.hover_navigation = None;
         if self.playback.is_none() {
@@ -296,6 +318,35 @@ impl PlayerShell {
         self.command(Command::Load(path), cx);
     }
 
+    fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.remember_view(Some(&path));
+        self.open_file_view(path, cx);
+    }
+
+    fn open_file_view(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.navigation_scan.take();
+        self.folder_navigation = true;
+        self.navigation.clear();
+        let path = if path.is_relative() {
+            std::env::current_dir()
+                .map(|dir| dir.join(&path))
+                .unwrap_or(path)
+        } else {
+            path
+        };
+        self.load_media(path.clone(), cx);
+        let scan = cx
+            .background_executor()
+            .spawn(async move { navigation::siblings(&path) });
+        self.navigation_scan = Some(cx.spawn(async move |this, cx| {
+            let queue = scan.await;
+            let _ = this.update(cx, |this, cx| {
+                this.navigation = queue;
+                cx.notify();
+            });
+        }));
+    }
+
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selection = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -307,8 +358,7 @@ impl PlayerShell {
             Ok(Ok(Some(paths))) => {
                 if let Some(path) = paths.into_iter().next() {
                     let _ = this.update_in(cx, |this, window, cx| {
-                        this.navigation.clear();
-                        this.load(path, cx);
+                        this.open_file(path, cx);
                         window.focus(&this.focus, cx);
                     });
                 }
@@ -342,11 +392,12 @@ impl PlayerShell {
                 browser.mark_played(self.path.clone().unwrap())
             });
         }
-        if self.path.is_some() && !self.navigation.is_empty() {
+        if !self.folder_navigation && self.path.is_some() && !self.navigation.is_empty() {
             self.navigation.retain(|path| {
                 Some(path) == self.path.as_ref() || self.browser.read(cx).exists(path)
             });
         }
+        self.update_navigation_hover(window, cx);
         let snapshot = &self.snapshot;
         self.media_controls.update(cx, |controls, cx| {
             controls.set_playing(!snapshot.paused, cx)
@@ -495,6 +546,13 @@ impl PlayerShell {
     }
 
     fn back_to_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_view(None);
+        self.show_library(window, cx);
+    }
+
+    fn show_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigation_scan.take();
+        self.navigation.clear();
         self.video_click.take();
         drop(self.playback.take());
         self.seeker_bar.update(cx, |seeker, _| {
@@ -514,21 +572,82 @@ impl PlayerShell {
     }
 
     fn adjacent(&self, next: bool) -> Option<PathBuf> {
-        let index = self
-            .navigation
-            .iter()
-            .position(|p| Some(p) == self.path.as_ref())?;
-        let index = if next {
-            index.checked_add(1)?
+        navigation::adjacent(&self.navigation, self.path.as_ref()?, next)
+    }
+
+    fn update_navigation_hover(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let position = window.mouse_position();
+        let size = window.viewport_size();
+        // Use pointer coordinates rather than hitbox hover. The button and preview
+        // occlude the video, but must not make their own proximity region flicker.
+        let hovered = navigation::near_edge(
+            position.x.into(),
+            position.y.into(),
+            size.width.into(),
+            size.height.into(),
+        )
+        .filter(|next| window.is_window_hovered() && self.adjacent(*next).is_some());
+        if self.hover_navigation != hovered {
+            self.hover_navigation = hovered;
+            cx.notify();
+        }
+    }
+
+    fn current_view(&self) -> NavigationView {
+        NavigationView {
+            path: self.path.clone(),
+            queue: self.navigation.clone(),
+            folder: self.folder_navigation,
+        }
+    }
+
+    fn remember_view(&mut self, target: Option<&PathBuf>) {
+        if target != self.path.as_ref() {
+            self.history.visit(self.current_view());
+        }
+    }
+
+    fn navigate_history(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.current_view();
+        let target = if forward {
+            self.history.forward(current)
         } else {
-            index.checked_sub(1)?
+            self.history.back(current)
         };
-        self.navigation.get(index).cloned()
+        if let Some(target) = target {
+            self.navigation_scan.take();
+            self.video_click.take();
+            if let Some(path) = target.path {
+                if target.folder {
+                    self.open_file_view(path, cx);
+                } else {
+                    self.folder_navigation = false;
+                    self.navigation = target.queue;
+                    self.load_media(path, cx);
+                }
+                window.focus(&self.focus, cx);
+            } else {
+                self.show_library(window, cx);
+            }
+        }
+        cx.stop_propagation();
     }
 }
 
 impl Render for PlayerShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let shell = cx.weak_entity();
+        // History buttons work over occluding panels and the library as well as
+        // the video. Root hitbox handlers alone cannot see all of those clicks.
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase == DispatchPhase::Capture
+                && let MouseButton::Navigate(direction) = event.button
+            {
+                let _ = shell.update(cx, |this, cx| {
+                    this.navigate_history(direction == NavigationDirection::Forward, window, cx);
+                });
+            }
+        });
         let error = self.error.clone().or_else(|| self.snapshot.error.clone());
         let title = self
             .path
@@ -542,8 +661,9 @@ impl Render for PlayerShell {
             .size_full()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.controls_dragging = event.pressed_button == Some(MouseButton::Left);
+                this.update_navigation_hover(window, cx);
                 this.reveal_controls(cx);
             }))
             .on_mouse_up(
@@ -553,8 +673,8 @@ impl Render for PlayerShell {
                     this.reveal_controls(cx);
                 }),
             )
-            // Keep the full-window native video visible beneath GPUI's
-            // DirectComposition layer. Only floating controls paint backgrounds.
+            // Native backdrop -> native video -> GPUI controls/library. Painting
+            // an opaque GPUI root would cover the video rather than sit behind it.
             .text_color(cx.theme().foreground)
             .child(
                 div()
@@ -737,71 +857,87 @@ impl Render for PlayerShell {
             .when(self.path.is_some() && self.controls_visible, |shell| {
                 let mut shell = shell;
                 for next in [false, true] {
-                    let target = self.adjacent(next);
+                    let Some(target) = self.adjacent(next) else {
+                        continue;
+                    };
                     let hovered = self.hover_navigation == Some(next);
-                    let image = target.as_ref().and_then(|path| {
-                        self.browser
-                            .update(cx, |browser, _| browser.thumbnail(path))
-                    });
+                    let image = hovered
+                        .then(|| {
+                            self.browser
+                                .update(cx, |browser, _| browser.thumbnail(&target))
+                        })
+                        .flatten();
                     shell = shell.child(
                         div()
                             .id(if next { "next-video" } else { "previous-video" })
                             .absolute()
-                            .top(relative(0.45))
+                            .top(relative(0.5))
+                            .mt(px(-120.0))
+                            .w(px(220.0))
+                            .h(px(240.0))
                             .when(next, |s| s.right_4())
                             .when(!next, |s| s.left_4())
-                            .occlude()
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
-                            .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
-                                this.hover_navigation = if *hovering { Some(next) } else { None };
-                                this.reveal_controls(cx);
-                                cx.notify();
-                            }))
                             .flex()
                             .flex_col()
+                            .justify_center()
+                            .when(next, |s| s.items_end())
+                            .when(!next, |s| s.items_start())
                             .gap_2()
-                            .child(
-                                Button::new(if next { "next-clip" } else { "previous-clip" })
-                                    .ghost()
-                                    .icon(if next {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronLeft
-                                    })
-                                    .disabled(target.is_none())
-                                    .label(if next { "Next" } else { "Previous" })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(path) = this.adjacent(next) {
-                                            this.load(path, cx);
-                                        }
-                                    })),
-                            )
                             .when(hovered, |s| {
-                                s.when_some(target, |s, path| {
-                                    s.child(
-                                        div()
-                                            .w(px(180.))
-                                            .p_2()
-                                            .rounded_md()
-                                            .bg(cx.theme().popover)
-                                            .when_some(image, |s, image| {
-                                                s.child(
-                                                    img(image)
-                                                        .w_full()
-                                                        .h(px(101.))
-                                                        .object_fit(ObjectFit::Contain),
-                                                )
+                                s.child(
+                                    div()
+                                        .occlude()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(Self::click_overlay),
+                                        )
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(
+                                            Button::new(if next {
+                                                "next-clip"
+                                            } else {
+                                                "previous-clip"
                                             })
-                                            .child(
-                                                div().text_xs().truncate().child(
-                                                    path.file_name()
-                                                        .unwrap_or_default()
-                                                        .to_string_lossy()
-                                                        .into_owned(),
+                                            .ghost()
+                                            .icon(if next {
+                                                IconName::ChevronRight
+                                            } else {
+                                                IconName::ChevronLeft
+                                            })
+                                            .label(if next { "Next" } else { "Previous" })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(path) = this.adjacent(next) {
+                                                    this.load(path, cx);
+                                                }
+                                            })),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(180.))
+                                                .p_2()
+                                                .rounded_md()
+                                                .bg(cx.theme().popover)
+                                                .when_some(image, |s, image| {
+                                                    s.child(
+                                                        img(image)
+                                                            .w_full()
+                                                            .h(px(101.))
+                                                            .object_fit(ObjectFit::Contain),
+                                                    )
+                                                })
+                                                .child(
+                                                    div().text_xs().truncate().child(
+                                                        target
+                                                            .file_name()
+                                                            .unwrap_or_default()
+                                                            .to_string_lossy()
+                                                            .into_owned(),
+                                                    ),
                                                 ),
-                                            ),
-                                    )
-                                })
+                                        ),
+                                )
                             }),
                     );
                 }
@@ -1009,7 +1145,7 @@ fn main() {
             let player = cx.new(|cx| {
                 let mut player = PlayerShell::new(window, cx);
                 if let Some(path) = std::env::args_os().nth(1) {
-                    player.load(PathBuf::from(path), cx);
+                    player.open_file(PathBuf::from(path), cx);
                 }
                 player
             });
@@ -1173,5 +1309,315 @@ mod overlay_tests {
 impl Drop for PlayerShell {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+#[cfg(all(test, windows))]
+mod layer_tests {
+    use super::{Command, app_assets};
+    #[test]
+    #[ignore = "interactive GPUI/native background composition and transition pixels"]
+    fn opaque_background_survives_video_transitions() {
+        use gpui_kit::*;
+        use std::{
+            rc::Rc,
+            sync::{Arc, Mutex},
+            time::Duration,
+        };
+        use windows_sys::Win32::{
+            Foundation::{POINT, RECT},
+            Graphics::Gdi::{ClientToScreen, GetDC, GetPixel, ReleaseDC},
+            UI::WindowsAndMessaging::*,
+        };
+
+        struct Layers {
+            playback: crate::playback::Playback,
+            host: Rc<crate::native_video::NativeVideo>,
+            video: bool,
+        }
+        impl Render for Layers {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let host = self.host.clone();
+                let video = self.video;
+                div()
+                    .relative()
+                    .size_full()
+                    .child(
+                        canvas(
+                            move |bounds, window, _| {
+                                if video {
+                                    host.layout(bounds, window.scale_factor());
+                                } else {
+                                    host.hide();
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .size_full(),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(80.))
+                            .h(px(40.))
+                            .bg(rgb(0xff0000)),
+                    )
+            }
+        }
+
+        // A white sentinel behind the app makes any transparent hole detectable.
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let sentinel = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                std::ptr::null(),
+                WS_POPUP | WS_VISIBLE | 0x00000006,
+                0,
+                0,
+                1400,
+                1000,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!sentinel.is_null());
+        struct Sentinel(windows_sys::Win32::Foundation::HWND);
+        impl Drop for Sentinel {
+            fn drop(&mut self) {
+                unsafe {
+                    DestroyWindow(self.0);
+                }
+            }
+        }
+        let _sentinel = Sentinel(sentinel);
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("first.avi");
+        let second = fixture.path().join("second.avi");
+        crate::playback::test_fixtures::avi(&first, 0, true);
+        crate::playback::test_fixtures::avi(&second, 0, true);
+        let report = Arc::new(Mutex::new(Vec::new()));
+        let samples = report.clone();
+        application()
+            .with_assets(app_assets::AppAssets)
+            .run(move |cx| {
+                init(cx);
+                let mut layers = None;
+                let handle = cx
+                    .open_window(
+                        WindowOptions {
+                            window_background: WindowBackgroundAppearance::Transparent,
+                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                point(px(100.), px(100.)),
+                                size(px(640.), px(480.)),
+                            ))),
+                            ..Default::default()
+                        },
+                        |window, cx| {
+                            let host =
+                                Rc::new(crate::native_video::NativeVideo::new(window).unwrap());
+                            let playback = crate::playback::Playback::native(host.hwnd()).unwrap();
+                            let view = cx.new(|_| Layers {
+                                host,
+                                playback,
+                                video: false,
+                            });
+                            layers = Some(view.clone());
+                            cx.new(|cx| {
+                                gpui_kit::base::Root::new(view, window, cx).bg(rgba(0x00000000))
+                            })
+                        },
+                    )
+                    .unwrap();
+                let layers = layers.unwrap();
+                cx.spawn(async move |cx| {
+                    let sample = |window: &Window, control: bool| -> u32 {
+                        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        let RawWindowHandle::Win32(raw) =
+                            HasWindowHandle::window_handle(window).unwrap().as_raw()
+                        else {
+                            unreachable!()
+                        };
+                        unsafe {
+                            let hwnd = raw.hwnd.get() as _;
+                            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                            // Keep screen-pixel assertions independent of other apps
+                            // stealing focus while this opt-in desktop test runs.
+                            assert_ne!(
+                                SetWindowPos(
+                                    hwnd,
+                                    HWND_TOPMOST,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                                ),
+                                0
+                            );
+                            assert_ne!(IsWindowVisible(hwnd), 0);
+                            let mut rect: RECT = std::mem::zeroed();
+                            GetClientRect(hwnd, &mut rect);
+                            let mut pos = if control {
+                                POINT { x: 10, y: 10 }
+                            } else {
+                                POINT {
+                                    x: rect.right / 2,
+                                    y: rect.bottom / 2,
+                                }
+                            };
+                            ClientToScreen(hwnd, &mut pos);
+                            let dc = GetDC(std::ptr::null_mut());
+                            let color = GetPixel(dc, pos.x, pos.y);
+                            ReleaseDC(std::ptr::null_mut(), dc);
+                            color
+                        }
+                    };
+                    cx.background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                    handle
+                        .update(cx, |_, window, _| {
+                            samples
+                                .lock()
+                                .unwrap()
+                                .push(("background", sample(window, false)));
+                            samples
+                                .lock()
+                                .unwrap()
+                                .push(("controls", sample(window, true)));
+                        })
+                        .unwrap();
+                    handle
+                        .update(cx, |_, _, cx| {
+                            layers.update(cx, |view, cx| {
+                                view.video = true;
+                                view.playback.send(Command::Load(first)).unwrap();
+                                cx.notify();
+                            });
+                        })
+                        .unwrap();
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                    handle
+                        .update(cx, |_, window, cx| {
+                            samples
+                                .lock()
+                                .unwrap()
+                                .push(("video", sample(window, false)));
+                            layers.update(cx, |view, _| {
+                                view.playback.send(Command::Load(second)).unwrap()
+                            });
+                        })
+                        .unwrap();
+                    for _ in 0..20 {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(20))
+                            .await;
+                        handle
+                            .update(cx, |_, window, _| {
+                                samples
+                                    .lock()
+                                    .unwrap()
+                                    .push(("transition", sample(window, false)));
+                            })
+                            .unwrap();
+                    }
+                    handle
+                        .update(cx, |_, _, cx| {
+                            layers.update(cx, |view, cx| {
+                                view.video = false;
+                                view.host.hide();
+                                cx.notify();
+                            });
+                        })
+                        .unwrap();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    handle
+                        .update(cx, |_, window, cx| {
+                            samples
+                                .lock()
+                                .unwrap()
+                                .push(("hidden video", sample(window, false)));
+                            layers.update(cx, |view, _| {
+                                view.playback.send(Command::Shutdown).unwrap();
+                            });
+                        })
+                        .unwrap();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    handle
+                        .update(cx, |_, window, _| {
+                            samples
+                                .lock()
+                                .unwrap()
+                                .push(("decoder shutdown", sample(window, false)));
+                            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                            let RawWindowHandle::Win32(raw) =
+                                HasWindowHandle::window_handle(window).unwrap().as_raw()
+                            else {
+                                unreachable!()
+                            };
+                            unsafe {
+                                SetWindowPos(
+                                    raw.hwnd.get() as _,
+                                    std::ptr::null_mut(),
+                                    0,
+                                    0,
+                                    1400,
+                                    800,
+                                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                                );
+                            }
+                        })
+                        .unwrap();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(150))
+                        .await;
+                    handle
+                    .update(cx, |_, window, cx| {
+                        samples
+                            .lock()
+                            .unwrap()
+                            .push(("resized background", sample(window, false)));
+                        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        let RawWindowHandle::Win32(raw) = HasWindowHandle::window_handle(window).unwrap().as_raw() else { unreachable!() };
+                        let mut rect: RECT = unsafe { std::mem::zeroed() };
+                        unsafe { GetClientRect(raw.hwnd.get() as _, &mut rect); }
+                        assert_eq!(layers.read(cx).host.backdrop_size(), [rect.right, rect.bottom], "Background must cover the entire resized client area");
+                        })
+                        .unwrap();
+                    handle.update(cx, |_, _, cx| cx.quit()).unwrap();
+                })
+                .detach();
+                cx.activate(true);
+            });
+        let samples = report.lock().unwrap();
+        assert_eq!(samples.len(), 26);
+        for (stage, color) in samples.iter() {
+            match *stage {
+                "controls" => assert_eq!(
+                    *color, 0x000000ff,
+                    "GPUI controls must remain above background"
+                ),
+                "video" => assert!(
+                    (*color >> 16) >= 128 && (*color & 0xffff) == 0,
+                    "Native video must remain above background: {color:#x}"
+                ),
+                "transition" => assert!(
+                    *color == 0 || ((*color >> 16) >= 128 && (*color & 0xffff) == 0),
+                    "Transparent transition pixel: {color:#x}"
+                ),
+                _ => assert_eq!(
+                    *color, 0,
+                    "Background disappeared during {stage}: {samples:?}"
+                ),
+            }
+        }
     }
 }
