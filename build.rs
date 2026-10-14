@@ -3,7 +3,7 @@ use std::{
     env,
     error::Error,
     fs,
-    io::{Read, Write},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -94,7 +94,9 @@ fn bundle() -> Result<(), Box<dyn Error>> {
     let mut files = Vec::new();
     collect(&extracted, &mut files)?;
     files.sort();
-    let mut manifest = "pub const EMBEDDED_FILES: &[(&str, &[u8], &str)] = &[\n".to_owned();
+    let compressed = output.join("compressed-resources");
+    fs::create_dir_all(&compressed)?;
+    let mut manifest = "const EMBEDDED_FILES: &[EmbeddedFile] = &[\n".to_owned();
     let mut bundle_digest = Sha256::new();
     bundle_digest.update(ARCHIVE_SHA256.as_bytes());
     let mut main_dll = None;
@@ -130,11 +132,13 @@ fn bundle() -> Result<(), Box<dyn Error>> {
             main_dll = Some(destination.clone());
         }
         let file_hash = file_digest(&file)?;
+        let compressed_file = compressed.join(format!("{file_hash}.zst"));
+        let size = compress_resource(&file, &compressed_file)?;
         bundle_digest.update(destination.as_bytes());
         bundle_digest.update(file_hash.as_bytes());
         manifest.push_str(&format!(
-            "    ({destination:?}, include_bytes!({:?}), {file_hash:?}),\n",
-            file.to_str().ok_or("non-UTF8 build path")?
+            "    EmbeddedFile {{ name: {destination:?}, compressed: include_bytes!({:?}), sha256: {file_hash:?}, size: {size} }},\n",
+            compressed_file.to_str().ok_or("non-UTF8 build path")?
         ));
     }
     let main_dll =
@@ -142,6 +146,8 @@ fn bundle() -> Result<(), Box<dyn Error>> {
     let notice =
         Path::new(&env::var("CARGO_MANIFEST_DIR")?).join("licenses/THIRD_PARTY_NOTICES.md");
     let notice_hash = file_digest(&notice)?;
+    let compressed_notice = compressed.join(format!("{notice_hash}.zst"));
+    let notice_size = compress_resource(&notice, &compressed_notice)?;
     let notice_name = "notices/THIRD_PARTY_NOTICES.md";
     if !names.insert(notice_name.to_ascii_lowercase()) {
         return Err("duplicate third-party notice filename".into());
@@ -149,8 +155,8 @@ fn bundle() -> Result<(), Box<dyn Error>> {
     bundle_digest.update(notice_name.as_bytes());
     bundle_digest.update(notice_hash.as_bytes());
     manifest.push_str(&format!(
-        "    ({notice_name:?}, include_bytes!({:?}), {notice_hash:?}),\n",
-        notice.to_str().ok_or("non-UTF8 notice path")?
+        "    EmbeddedFile {{ name: {notice_name:?}, compressed: include_bytes!({:?}), sha256: {notice_hash:?}, size: {notice_size} }},\n",
+        compressed_notice.to_str().ok_or("non-UTF8 notice path")?
     ));
     // Version all resources together, so notice changes cannot invalidate an
     // existing cache that has the same decoder archive but an older manifest.
@@ -160,6 +166,19 @@ fn bundle() -> Result<(), Box<dyn Error>> {
     ));
     fs::write(output.join("decoder_assets.rs"), manifest)?;
     Ok(())
+}
+
+fn compress_resource(source: &Path, destination: &Path) -> Result<u64, Box<dyn Error>> {
+    let mut input = fs::File::open(source)?;
+    let size = input.metadata()?.len();
+    let output = BufWriter::new(fs::File::create(destination)?);
+    // Spend compression time at build time, never on the playback path.
+    let mut encoder = zstd::stream::write::Encoder::new(output, 19)?;
+    encoder.set_pledged_src_size(Some(size))?;
+    encoder.include_checksum(true)?;
+    std::io::copy(&mut input, &mut encoder)?;
+    encoder.finish()?.flush()?;
+    Ok(size)
 }
 
 fn download(destination: &Path) -> Result<(), Box<dyn Error>> {

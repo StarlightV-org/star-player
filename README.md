@@ -23,7 +23,9 @@ The finished app needs no network connection for local playback or previews. It 
 
 ## Build and run
 
-Install Rust and the native build prerequisites for GPUI. A clean build downloads the pinned decoder archive, about 32 MB, from GitHub and verifies its SHA-256 before extraction and embedding. This is a build-time download only. The EXE is larger because it contains the decoder.
+Install Rust and the native build prerequisites for GPUI. A clean build downloads the pinned decoder archive, about 32 MB, from GitHub and verifies its SHA-256 before extraction. The build compresses runtime resources with Zstandard before embedding them in the EXE. This is a build-time download only.
+
+On first use, Spacer streams decompressed resources into the runtime cache and verifies their original size and SHA-256 before publishing the bundle. Later launches reuse the verified cache without decompression. The loaded decoder is byte-for-byte identical to the upstream DLL, so compression does not change playback or hardware acceleration. Existing valid caches remain compatible. The extracted decoder's disk size is unchanged.
 
 ```sh
 cargo run
