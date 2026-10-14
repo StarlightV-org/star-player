@@ -2,7 +2,7 @@
 
 use components::{
     audio_tracks::{AudioTracks, TrackGainEvent},
-    clip_browser::{BrowserEvent, ClipBrowser},
+    clip_browser::{BrowserEvent, BrowserView, ClipBrowser},
     media_controls::{MediaControls, MediaControlsEvent},
     seeker_bar::{SeekerBar, SeekerEvent},
     volume_controls::{VolumeControls, VolumeEvent},
@@ -35,6 +35,9 @@ mod playback;
 mod preview;
 mod runtime;
 mod theme;
+mod thumbnail_cache;
+#[cfg(all(test, windows))]
+mod todo_tests;
 mod window_cursor;
 
 /// GPUI's texture upload expects BGRA, while our decoders produce RGBA.
@@ -51,6 +54,7 @@ struct NavigationView {
     path: Option<PathBuf>,
     queue: Vec<PathBuf>,
     folder: bool,
+    browser: BrowserView,
 }
 
 struct PlayerShell {
@@ -60,6 +64,15 @@ struct PlayerShell {
     navigation_scan: Option<Task<()>>,
     history: navigation::History<NavigationView>,
     played_recorded: bool,
+    pending_load: Option<PathBuf>,
+    audio_initialized: bool,
+    master_volume: f64,
+    master_muted: bool,
+    pending_master: Option<(f64, bool)>,
+    pending_audio: Option<(PathBuf, std::collections::BTreeMap<i64, f64>)>,
+    audio_changed: Instant,
+    rename_resume: Option<(PathBuf, f64, bool)>,
+    rename_busy: bool,
     hover_navigation: Option<bool>,
     playback: Option<Playback>,
     snapshot: Snapshot,
@@ -86,6 +99,14 @@ struct PlayerShell {
 impl PlayerShell {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let browser = cx.new(|cx| ClipBrowser::new(std::env::args_os().nth(1).is_none(), cx));
+        Self::with_browser(browser, window, cx)
+    }
+
+    fn with_browser(
+        browser: Entity<ClipBrowser>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let media_controls = cx.new(|_| MediaControls::default());
         let volume_controls = cx.new(VolumeControls::new);
         let seeker_bar = cx.new(|cx| SeekerBar::new(0.0, cx));
@@ -96,7 +117,10 @@ impl PlayerShell {
                 window,
                 |this, _, event: &BrowserEvent, window, cx| match event {
                     BrowserEvent::Play(path, list) => {
-                        this.remember_view(Some(path));
+                        if this.rename_busy {
+                            return;
+                        }
+                        this.remember_view(Some(path), cx);
                         this.navigation_scan.take();
                         this.folder_navigation = false;
                         this.navigation = list.clone();
@@ -104,6 +128,9 @@ impl PlayerShell {
                         window.focus(&this.focus, cx);
                     }
                     BrowserEvent::Delete(paths) => {
+                        if this.rename_busy {
+                            return;
+                        }
                         if this.path.as_ref().is_some_and(|path| paths.contains(path)) {
                             this.back_to_library(window, cx);
                         }
@@ -113,6 +140,82 @@ impl PlayerShell {
                         this.browser.read(cx).delete(paths.clone(), released);
                     }
                     BrowserEvent::Open => this.open(window, cx),
+                    BrowserEvent::Navigate(previous) => {
+                        let mut view = this.current_view(cx);
+                        view.browser = previous.clone();
+                        this.history.visit(view);
+                    }
+                    BrowserEvent::Rename(path, stem) => {
+                        if this.rename_busy {
+                            return;
+                        }
+                        this.rename_busy = true;
+                        this.navigation_scan.take();
+                        this.flush_audio(cx);
+                        if this.path.as_ref() == Some(path) {
+                            this.rename_resume =
+                                Some((path.clone(), this.snapshot.position, this.snapshot.paused));
+                            this.video_click.take();
+                            drop(this.playback.take());
+                        }
+                        let released = this
+                            .seeker_bar
+                            .update(cx, |seeker, _| seeker.suspend_previews());
+                        this.browser
+                            .read(cx)
+                            .rename(path.clone(), stem.clone(), released);
+                    }
+                    BrowserEvent::Renamed(old, new) => {
+                        this.rename_busy = false;
+                        for path in &mut this.navigation {
+                            if path == old {
+                                *path = new.clone();
+                            }
+                        }
+                        this.history.update(|view| {
+                            if view.path.as_ref() == Some(old) {
+                                view.path = Some(new.clone());
+                            }
+                            for path in &mut view.queue {
+                                if path == old {
+                                    *path = new.clone();
+                                }
+                            }
+                            view.browser.rename(old, new);
+                        });
+                        if let Some((_, position, paused)) = this.rename_resume.take() {
+                            this.load_media_at(new.clone(), position, paused, cx);
+                        } else if let Some(path) = this.path.clone() {
+                            this.seeker_bar
+                                .update(cx, |seeker, cx| seeker.set_media(path, cx));
+                        }
+                        if this.folder_navigation
+                            && let Some(path) = this.path.clone()
+                        {
+                            this.scan_navigation(path, cx);
+                        }
+                    }
+                    BrowserEvent::RenameFailed(path, error) => {
+                        this.rename_busy = false;
+                        if let Some((_, position, paused)) = this.rename_resume.take() {
+                            this.load_media_at(path.clone(), position, paused, cx);
+                        } else if let Some(path) = this.path.clone() {
+                            this.seeker_bar
+                                .update(cx, |seeker, cx| seeker.set_media(path, cx));
+                        }
+                        if this.folder_navigation
+                            && let Some(path) = this.path.clone()
+                        {
+                            this.scan_navigation(path, cx);
+                        }
+                        this.error = Some(error.clone());
+                        crate::logging::Print(crate::logging::Level::Warn, error);
+                        cx.notify();
+                    }
+                    BrowserEvent::Error(error) => {
+                        this.error = Some(error.clone());
+                        cx.notify();
+                    }
                 },
             ),
             cx.subscribe_in(
@@ -190,7 +293,10 @@ impl PlayerShell {
         };
         let shell_entity = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
-            let _ = shell_entity.update(cx, |shell, _| shell.shutdown());
+            let _ = shell_entity.update(cx, |shell, cx| {
+                shell.flush_audio(cx);
+                shell.shutdown();
+            });
             true
         });
         let focus = cx.focus_handle();
@@ -202,6 +308,15 @@ impl PlayerShell {
             navigation_scan: None,
             history: navigation::History::default(),
             played_recorded: false,
+            pending_load: None,
+            audio_initialized: false,
+            master_volume: 100.0,
+            master_muted: false,
+            pending_master: None,
+            pending_audio: None,
+            audio_changed: Instant::now(),
+            rename_resume: None,
+            rename_busy: false,
             hover_navigation: None,
             playback,
             snapshot: Snapshot::default(),
@@ -228,6 +343,38 @@ impl PlayerShell {
     }
 
     fn command(&mut self, command: Command, cx: &mut Context<Self>) {
+        if self.rename_busy {
+            return;
+        }
+        match &command {
+            Command::SetVolume(volume) => {
+                self.master_volume = *volume;
+                self.pending_master = Some((*volume, self.master_muted));
+                self.audio_changed = Instant::now();
+            }
+            Command::SetMute(muted) => {
+                self.master_muted = *muted;
+                self.pending_master = Some((self.master_volume, *muted));
+                self.audio_changed = Instant::now();
+            }
+            Command::SetTrackGain { id, gain } => {
+                if let Some(path) = &self.path {
+                    let (_, gains) = self.pending_audio.get_or_insert_with(|| {
+                        (
+                            path.clone(),
+                            self.snapshot
+                                .tracks
+                                .iter()
+                                .map(|t| (t.id, t.gain))
+                                .collect(),
+                        )
+                    });
+                    gains.insert(*id, *gain);
+                    self.audio_changed = Instant::now();
+                }
+            }
+            _ => {}
+        }
         self.video_click.take();
         self.reveal_controls(cx);
         if let Some(player) = &self.playback {
@@ -236,6 +383,17 @@ impl PlayerShell {
             }
         }
         cx.notify();
+    }
+
+    fn flush_audio(&mut self, cx: &mut Context<Self>) {
+        if let Some((volume, muted)) = self.pending_master.take() {
+            self.browser
+                .update(cx, |browser, _| browser.save_master(volume, muted));
+        }
+        if let Some((path, gains)) = self.pending_audio.take() {
+            self.browser
+                .update(cx, |browser, _| browser.save_audio(path, gains));
+        }
     }
 
     fn reveal_controls(&mut self, cx: &mut Context<Self>) {
@@ -287,11 +445,33 @@ impl PlayerShell {
     }
 
     fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.remember_view(Some(&path));
+        if self.rename_busy {
+            return;
+        }
+        self.remember_view(Some(&path), cx);
         self.load_media(path, cx);
     }
 
     fn load_media(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.load_media_at(path, 0.0, false, cx);
+    }
+
+    fn load_media_at(
+        &mut self,
+        path: PathBuf,
+        position: f64,
+        paused: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.flush_audio(cx);
+        if !self.browser.read(cx).audio_ready() {
+            self.path = Some(path.clone());
+            self.pending_load = Some(path);
+            cx.notify();
+            return;
+        }
+        self.initialize_audio(cx);
+        self.pending_load = None;
         self.played_recorded = false;
         self.hover_navigation = None;
         if self.playback.is_none() {
@@ -315,11 +495,35 @@ impl PlayerShell {
         self.path = Some(path.clone());
         self.seeker_bar
             .update(cx, |seeker, cx| seeker.set_media(path.clone(), cx));
-        self.command(Command::Load(path), cx);
+        let gains = self.browser.read(cx).media_state(&path).track_gains;
+        self.command(
+            Command::LoadSaved(
+                path,
+                playback::LoadState {
+                    volume: self.master_volume,
+                    muted: self.master_muted,
+                    gains,
+                    position,
+                    paused,
+                },
+            ),
+            cx,
+        );
+    }
+
+    fn initialize_audio(&mut self, cx: &Context<Self>) {
+        if !self.audio_initialized && self.browser.read(cx).audio_ready() {
+            self.master_volume = self.browser.read(cx).config().volume;
+            self.master_muted = self.browser.read(cx).config().muted;
+            self.audio_initialized = true;
+        }
     }
 
     fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.remember_view(Some(&path));
+        if self.rename_busy {
+            return;
+        }
+        self.remember_view(Some(&path), cx);
         self.open_file_view(path, cx);
     }
 
@@ -335,6 +539,10 @@ impl PlayerShell {
             path
         };
         self.load_media(path.clone(), cx);
+        self.scan_navigation(path, cx);
+    }
+
+    fn scan_navigation(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let scan = cx
             .background_executor()
             .spawn(async move { navigation::siblings(&path) });
@@ -348,6 +556,9 @@ impl PlayerShell {
     }
 
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename_busy {
+            return;
+        }
         let selection = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -378,6 +589,15 @@ impl PlayerShell {
         self.browser.update(cx, |browser, cx| {
             browser.poll(self.path.is_none(), window, cx)
         });
+        self.initialize_audio(cx);
+        if self.browser.read(cx).audio_ready()
+            && let Some(path) = self.pending_load.take()
+        {
+            self.load_media(path, cx);
+        }
+        if self.audio_changed.elapsed() >= Duration::from_millis(350) {
+            self.flush_audio(cx);
+        }
         if let Some(player) = &self.playback {
             self.snapshot = player.snapshot();
         }
@@ -433,6 +653,7 @@ impl PlayerShell {
         }
         self.controls_visible = controls_should_show(
             self.path.is_none()
+                || self.rename_busy
                 || self.snapshot.paused
                 || self.hover_navigation.is_some()
                 || self.error.is_some()
@@ -465,6 +686,10 @@ impl PlayerShell {
             return;
         }
         if self.path.is_none() {
+            if key == "escape" && !modifiers.shift {
+                self.browser.update(cx, |browser, cx| browser.deselect(cx));
+                cx.stop_propagation();
+            }
             return;
         }
         let command = match key {
@@ -546,11 +771,19 @@ impl PlayerShell {
     }
 
     fn back_to_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.remember_view(None);
+        if self.rename_busy {
+            return;
+        }
+        self.remember_view(None, cx);
         self.show_library(window, cx);
     }
 
     fn show_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_audio(cx);
+        self.pending_load = None;
+        if window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
         self.navigation_scan.take();
         self.navigation.clear();
         self.video_click.take();
@@ -593,28 +826,34 @@ impl PlayerShell {
         }
     }
 
-    fn current_view(&self) -> NavigationView {
+    fn current_view(&self, cx: &Context<Self>) -> NavigationView {
         NavigationView {
             path: self.path.clone(),
             queue: self.navigation.clone(),
             folder: self.folder_navigation,
+            browser: self.browser.read(cx).view(),
         }
     }
 
-    fn remember_view(&mut self, target: Option<&PathBuf>) {
+    fn remember_view(&mut self, target: Option<&PathBuf>, cx: &Context<Self>) {
         if target != self.path.as_ref() {
-            self.history.visit(self.current_view());
+            self.history.visit(self.current_view(cx));
         }
     }
 
     fn navigate_history(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.current_view();
+        if self.rename_busy {
+            return;
+        }
+        let current = self.current_view(cx);
         let target = if forward {
             self.history.forward(current)
         } else {
             self.history.back(current)
         };
         if let Some(target) = target {
+            self.browser
+                .update(cx, |browser, cx| browser.restore(target.browser, cx));
             self.navigation_scan.take();
             self.video_click.take();
             if let Some(path) = target.path {
@@ -630,7 +869,6 @@ impl PlayerShell {
                 self.show_library(window, cx);
             }
         }
-        cx.stop_propagation();
     }
 }
 
@@ -639,15 +877,28 @@ impl Render for PlayerShell {
         let shell = cx.weak_entity();
         // History buttons work over occluding panels and the library as well as
         // the video. Root hitbox handlers alone cannot see all of those clicks.
-        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-            if phase == DispatchPhase::Capture
-                && let MouseButton::Navigate(direction) = event.button
-            {
-                let _ = shell.update(cx, |this, cx| {
-                    this.navigate_history(direction == NavigationDirection::Forward, window, cx);
+        let history_events = canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let shell = shell.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture
+                        && let MouseButton::Navigate(direction) = event.button
+                    {
+                        let _ = shell.update(cx, |this, cx| {
+                            this.navigate_history(
+                                direction == NavigationDirection::Forward,
+                                window,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        });
+                    }
                 });
-            }
-        });
+            },
+        )
+        .absolute()
+        .size_full();
         let error = self.error.clone().or_else(|| self.snapshot.error.clone());
         let title = self
             .path
@@ -676,6 +927,7 @@ impl Render for PlayerShell {
             // Native backdrop -> native video -> GPUI controls/library. Painting
             // an opaque GPUI root would cover the video rather than sit behind it.
             .text_color(cx.theme().foreground)
+            .child(history_events)
             .child(
                 div()
                     .absolute()
@@ -828,6 +1080,25 @@ impl Render for PlayerShell {
                                             .items_center()
                                             .gap_2()
                                             .child(self.volume_controls.clone())
+                                            .child(
+                                                Button::new("rename-media")
+                                                    .ghost()
+                                                    .label("Rename")
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            if let Some(path) = this.path.clone() {
+                                                                this.browser.update(
+                                                                    cx,
+                                                                    |browser, cx| {
+                                                                        browser.prompt_rename(
+                                                                            path, window, cx,
+                                                                        )
+                                                                    },
+                                                                );
+                                                            }
+                                                        },
+                                                    )),
+                                            )
                                             .when(!self.snapshot.tracks.is_empty(), |controls| {
                                                 controls.child(
                                                     Button::new("audio-mixer")
@@ -1580,16 +1851,26 @@ mod layer_tests {
                         .timer(Duration::from_millis(150))
                         .await;
                     handle
-                    .update(cx, |_, window, cx| {
-                        samples
-                            .lock()
-                            .unwrap()
-                            .push(("resized background", sample(window, false)));
-                        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                        let RawWindowHandle::Win32(raw) = HasWindowHandle::window_handle(window).unwrap().as_raw() else { unreachable!() };
-                        let mut rect: RECT = unsafe { std::mem::zeroed() };
-                        unsafe { GetClientRect(raw.hwnd.get() as _, &mut rect); }
-                        assert_eq!(layers.read(cx).host.backdrop_size(), [rect.right, rect.bottom], "Background must cover the entire resized client area");
+                        .update(cx, |_, window, cx| {
+                            samples
+                                .lock()
+                                .unwrap()
+                                .push(("resized background", sample(window, false)));
+                            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                            let RawWindowHandle::Win32(raw) =
+                                HasWindowHandle::window_handle(window).unwrap().as_raw()
+                            else {
+                                unreachable!()
+                            };
+                            let mut rect: RECT = unsafe { std::mem::zeroed() };
+                            unsafe {
+                                GetClientRect(raw.hwnd.get() as _, &mut rect);
+                            }
+                            assert_eq!(
+                                layers.read(cx).host.backdrop_size(),
+                                [rect.right, rect.bottom],
+                                "Background must cover the entire resized client area"
+                            );
                         })
                         .unwrap();
                     handle.update(cx, |_, _, cx| cx.quit()).unwrap();

@@ -6,7 +6,7 @@ use crate::{
 use notify::{RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -140,6 +140,10 @@ pub enum Request {
     Thumbnail(PathBuf, Stamp),
     Watched(Vec<PathBuf>, bool, String),
     Delete(Vec<PathBuf>, Arc<AtomicBool>),
+    Audio(PathBuf, BTreeMap<i64, f64>),
+    Master(f64, bool),
+    Rename(PathBuf, String, Arc<AtomicBool>),
+    Shutdown,
 }
 pub enum Event {
     Config(Config),
@@ -148,27 +152,44 @@ pub enum Event {
     Thumbnail(PathBuf, Stamp, Option<image::RgbaImage>),
     WatchedComplete(Vec<PathBuf>),
     Error(String),
+    Renamed(PathBuf, PathBuf),
+    RenameFailed(PathBuf, String),
 }
 
 pub struct LibraryWorker {
     tx: mpsc::Sender<Request>,
     rx: mpsc::Receiver<Event>,
     stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 impl LibraryWorker {
     pub fn new() -> Self {
+        Self::with_directory(None)
+    }
+    #[cfg(test)]
+    pub fn for_test(directory: PathBuf) -> Self {
+        Self::with_directory(Some(directory))
+    }
+    fn with_directory(directory: Option<PathBuf>) -> Self {
         let (tx, requests) = mpsc::channel();
         let (events, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
-        thread::spawn(move || {
-            let result = clip_store::directory()
+        let worker = thread::spawn(move || {
+            let result = directory
+                .map(Ok)
+                .unwrap_or_else(clip_store::directory)
                 .and_then(|dir| run(&dir, requests, events.clone(), stopping));
             if let Err(error) = result {
                 let _ = events.send(Event::Error(error));
             }
         });
-        Self { tx, rx, stop }
+        Self {
+            tx,
+            rx,
+            stop,
+            worker: Some(worker),
+        }
     }
     pub fn send(&self, request: Request) {
         let _ = self.tx.send(request);
@@ -186,6 +207,10 @@ impl LibraryWorker {
 }
 impl Drop for LibraryWorker {
     fn drop(&mut self) {
+        let _ = self.tx.send(Request::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
         self.stop.store(true, Ordering::Release);
     }
 }
@@ -233,9 +258,114 @@ fn run(
     let mut watched_tasks = VecDeque::new();
     let mut decoder = None::<PreviewDecoder>;
     let mut catalog = Catalog::default();
+    let mut closing = false;
+    if let Err(e) = crate::thumbnail_cache::prune(&dir.join("thumbnails")) {
+        let _ = events.send(Event::Error(e));
+    }
     while !stop.load(Ordering::Acquire) {
         for request in requests.try_iter() {
             match request {
+                Request::Shutdown => {
+                    closing = true;
+                    tasks.clear();
+                }
+                Request::Audio(path, gains) => {
+                    let result = (|| {
+                        if !history_valid {
+                            return Err("Repair watched.csv before saving audio settings".into());
+                        }
+                        clip_store::validate_gains(&gains)?;
+                        let mut next = history.clone();
+                        let mut state = clip_store::media_state(&next, &path);
+                        state.track_gains = gains;
+                        next.insert(clip_store::hash_filename(&path)?, state);
+                        clip_store::save_history(dir, &next)?;
+                        history = next;
+                        Ok::<_, String>(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            let _ = events.send(Event::History(history.clone()));
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Error(e));
+                        }
+                    }
+                }
+                Request::Master(volume, muted) => {
+                    let mut next = config.clone();
+                    next.volume = volume;
+                    next.muted = muted;
+                    let result =
+                        if config_valid && volume.is_finite() && (0.0..=100.0).contains(&volume) {
+                            clip_store::save_config(dir, &next)
+                        } else {
+                            Err("Cannot save invalid master volume or config.json".into())
+                        };
+                    match result {
+                        Ok(()) => {
+                            config = next;
+                            let _ = events.send(Event::Config(config.clone()));
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Error(e));
+                        }
+                    }
+                }
+                Request::Rename(path, stem, released) => {
+                    decoder = None;
+                    tasks.retain(|task| !matches!(task, Request::Thumbnail(p, _) if p == &path));
+                    let deadline = Instant::now() + Duration::from_secs(6);
+                    while !released.load(Ordering::Acquire) && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    let result = if !released.load(Ordering::Acquire) {
+                        Err(RenameFailure::from(
+                            "Preview decoder is still releasing the file. Retry rename.",
+                        ))
+                    } else if !history_valid {
+                        Err(RenameFailure::from(
+                            "Repair watched.csv before renaming files",
+                        ))
+                    } else {
+                        rename_clip(dir, &path, &stem, &catalog, &mut history)
+                    };
+                    match result {
+                        Ok(new) => {
+                            for task in &mut watched_tasks {
+                                if let Request::Watched(paths, _, _) = task {
+                                    for p in paths {
+                                        if *p == path {
+                                            *p = new.clone();
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = events.send(Event::History(history.clone()));
+                            let _ = events.send(Event::Renamed(path, new));
+                            dirty = Some(Instant::now() - Duration::from_secs(1));
+                        }
+                        Err(e) => {
+                            if let Some(new) = e.current_path {
+                                for task in &mut watched_tasks {
+                                    if let Request::Watched(paths, _, _) = task {
+                                        for p in paths {
+                                            if *p == path {
+                                                *p = new.clone();
+                                            }
+                                        }
+                                    }
+                                }
+                                let _ = events.send(Event::History(history.clone()));
+                                let _ = events.send(Event::Renamed(path, new));
+                                let _ = events.send(Event::Error(e.message));
+                                dirty = Some(Instant::now() - Duration::from_secs(1));
+                            } else {
+                                let _ = events.send(Event::RenameFailed(path, e.message));
+                            }
+                        }
+                    }
+                }
                 Request::Consent(enabled) => {
                     if !config_valid {
                         let _ = events.send(Event::Error(
@@ -390,6 +520,28 @@ fn run(
             }
             let (next, errors) = scan(&config.clip_directories);
             catalog = next;
+            if history_valid {
+                let mut migrated = history.clone();
+                for clip in &catalog.clips {
+                    if let Ok(hash) = clip_store::hash_filename(&clip.path) {
+                        let state = clip_store::media_state(&history, &clip.path);
+                        if !migrated.contains_key(&hash) && !state.watched_at.is_empty() {
+                            migrated.insert(hash, state);
+                        }
+                    }
+                }
+                if migrated != history {
+                    match clip_store::save_history(dir, &migrated) {
+                        Ok(()) => {
+                            history = migrated;
+                            let _ = events.send(Event::History(history.clone()));
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Error(e));
+                        }
+                    }
+                }
+            }
             let _ = events.send(Event::Catalog(catalog.clone()));
             if !errors.is_empty() {
                 let _ = events.send(Event::Error(errors.join("\n")));
@@ -413,9 +565,13 @@ fn run(
                         match result {
                             Ok(hash) => {
                                 if value {
-                                    next.insert(hash.clone(), timestamp.clone());
+                                    let mut state = clip_store::media_state(&next, path);
+                                    state.watched_at = timestamp.clone();
+                                    next.insert(hash.clone(), state);
                                 } else {
-                                    next.remove(&hash);
+                                    let mut state = clip_store::media_state(&next, path);
+                                    state.watched_at.clear();
+                                    next.insert(hash, state);
                                 }
                             }
                             Err(e) => {
@@ -463,10 +619,10 @@ fn run(
                                 if stamp(&path).ok().as_ref() != Some(&expected) {
                                     return None;
                                 }
-                                let _ = fs::create_dir_all(cache.parent().unwrap());
-                                let _ = image::DynamicImage::ImageRgba8(image.clone())
-                                    .into_rgb8()
-                                    .save(&cache);
+                                if let Err(e) = crate::thumbnail_cache::save(&cache, &image) {
+                                    let _ =
+                                        events.send(Event::Error(format!("Thumbnail cache: {e}")));
+                                }
                                 Some(image)
                             }
                             Err(_) => {
@@ -479,6 +635,8 @@ fn run(
                 }
                 _ => {}
             }
+        } else if closing {
+            break;
         } else {
             thread::sleep(Duration::from_millis(30));
         }
@@ -486,9 +644,262 @@ fn run(
     Ok(())
 }
 
+pub fn rename_destination(path: &Path, stem: &str) -> Result<PathBuf, String> {
+    if stem.is_empty()
+        || stem.trim() != stem
+        || stem.ends_with('.')
+        || stem
+            .chars()
+            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+    {
+        return Err("Enter a valid Windows filename without an extension".into());
+    }
+    let base = stem
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            base.strip_prefix(prefix).is_some_and(|n| {
+                matches!(
+                    n,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        })
+    {
+        return Err("That filename is reserved by Windows".into());
+    }
+    let mut filename = std::ffi::OsString::from(stem);
+    if let Some(extension) = path.extension() {
+        filename.push(".");
+        filename.push(extension);
+    }
+    Ok(path.with_file_name(filename))
+}
+
+/// MoveFileW refuses an existing destination, including a race after validation.
+fn rename_no_replace(old: &Path, new: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn MoveFileW(old: *const u16, new: *const u16) -> i32;
+        }
+        let old: Vec<u16> = old.as_os_str().encode_wide().chain(Some(0)).collect();
+        let new: Vec<u16> = new.as_os_str().encode_wide().chain(Some(0)).collect();
+        if unsafe { MoveFileW(old.as_ptr(), new.as_ptr()) } == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::hard_link(old, new).map_err(|e| e.to_string())?;
+        if let Err(e) = fs::remove_file(old) {
+            let _ = fs::remove_file(new);
+            return Err(e.to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct RenameFailure {
+    message: String,
+    current_path: Option<PathBuf>,
+}
+impl From<String> for RenameFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            current_path: None,
+        }
+    }
+}
+impl From<&str> for RenameFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+fn rename_clip(
+    dir: &Path,
+    old: &Path,
+    stem: &str,
+    catalog: &Catalog,
+    history: &mut History,
+) -> Result<PathBuf, RenameFailure> {
+    let new = rename_destination(old, stem)?;
+    if old == new {
+        return Ok(new);
+    }
+    if let Some(clip) = catalog.clips.iter().find(|c| c.path == old) {
+        if stamp(old)? != clip.stamp {
+            return Err("File changed since selection; refresh before renaming".into());
+        }
+    }
+    let old_hash = clip_store::hash_filename(old)?;
+    let new_hash = clip_store::hash_filename(&new)?;
+    let state = clip_store::media_state(history, old);
+    let mut next = history.clone();
+    // Do not silently overwrite another file's settings under a shared identity.
+    if next
+        .get(&new_hash)
+        .is_some_and(|existing| existing != &state)
+    {
+        return Err("The destination identity already has different saved settings".into());
+    }
+    next.insert(new_hash, state);
+    if !catalog.clips.iter().any(|c| {
+        c.path != old && clip_store::hash_filename(&c.path).ok().as_ref() == Some(&old_hash)
+    }) {
+        next.remove(&old_hash);
+    }
+    rename_no_replace(old, &new)?;
+    if let Err(error) = clip_store::save_history(dir, &next) {
+        return match rename_no_replace(&new, old) {
+            Ok(()) => Err(format!("Rename rolled back: {error}").into()),
+            Err(rollback) => {
+                *history = next;
+                Err(RenameFailure {
+                    message: format!(
+                        "File is now {}; settings could not be saved: {error}. Rollback failed: {rollback}",
+                        new.display()
+                    ),
+                    current_path: Some(new),
+                })
+            }
+        };
+    }
+    *history = next;
+    Ok(new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rename_preserves_settings_and_refuses_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.mp4");
+        fs::write(&old, b"video").unwrap();
+        let state = clip_store::MediaState {
+            identity_version: 2,
+            watched_at: "2026-10-14T18:42:00Z".into(),
+            track_gains: BTreeMap::from([(1, 0.25), (2, 0.0)]),
+        };
+        let old_hash = clip_store::hash_filename(&old).unwrap();
+        let mut history = History::from([(old_hash.clone(), state.clone())]);
+        let (catalog, _) = scan(&[dir.path().to_owned()]);
+        let new = rename_clip(dir.path(), &old, "new", &catalog, &mut history).unwrap();
+        assert!(!old.exists());
+        assert_eq!(fs::read(&new).unwrap(), b"video");
+        assert_eq!(clip_store::media_state(&history, &new), state);
+        assert!(!history.contains_key(&old_hash));
+        assert_eq!(clip_store::read_history(dir.path()).unwrap(), history);
+        let existing = dir.path().join("existing.mp4");
+        fs::write(&existing, b"do not replace").unwrap();
+        assert!(
+            rename_clip(
+                dir.path(),
+                &new,
+                "existing",
+                &Catalog::default(),
+                &mut history
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&existing).unwrap(), b"do not replace");
+        assert!(new.exists());
+    }
+    #[test]
+    fn rename_rolls_back_if_history_cannot_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("watched.csv")).unwrap();
+        let old = dir.path().join("old.mp4");
+        fs::write(&old, b"video").unwrap();
+        let mut history = History::new();
+        assert!(rename_clip(dir.path(), &old, "new", &Catalog::default(), &mut history).is_err());
+        assert!(old.exists());
+        assert!(!dir.path().join("new.mp4").exists());
+        assert!(history.is_empty());
+    }
+    #[test]
+    fn rename_retains_a_shared_old_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("a/Game/clip.mp4");
+        let shared = root.path().join("b/Game/clip.mp4");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(&old, b"a").unwrap();
+        fs::write(&shared, b"b").unwrap();
+        let state = clip_store::MediaState {
+            identity_version: 2,
+            watched_at: "2026-10-14T18:42:00Z".into(),
+            ..Default::default()
+        };
+        let mut history =
+            History::from([(clip_store::hash_filename(&old).unwrap(), state.clone())]);
+        let (catalog, _) = scan(&[root.path().to_owned()]);
+        let new = rename_clip(root.path(), &old, "renamed", &catalog, &mut history).unwrap();
+        assert_eq!(clip_store::media_state(&history, &shared), state);
+        assert_eq!(clip_store::media_state(&history, &new), state);
+    }
+    #[test]
+    fn rename_validates_windows_names_and_keeps_extension() {
+        for name in [
+            "", "..", "CON", "nul.txt", "COM1", "LPT9", "a/b", "a\\b", "x:", " x", "x ", "x.",
+        ] {
+            assert!(
+                rename_destination(Path::new("clip.MP4"), name).is_err(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            rename_destination(Path::new("Game/clip.MP4"), "new name").unwrap(),
+            PathBuf::from("Game/new name.MP4")
+        );
+    }
+    #[test]
+    fn worker_shutdown_drains_queued_settings_and_watched_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        fs::write(&path, b"video").unwrap();
+        let (tx, requests) = mpsc::channel();
+        let (events, _rx) = mpsc::channel();
+        tx.send(Request::Audio(path.clone(), BTreeMap::from([(1, 0.4)])))
+            .unwrap();
+        tx.send(Request::Master(32.0, true)).unwrap();
+        tx.send(Request::Watched(
+            vec![path.clone()],
+            true,
+            "2026-10-14T18:42:00Z".into(),
+        ))
+        .unwrap();
+        tx.send(Request::Watched(
+            vec![path.clone()],
+            false,
+            "2026-10-14T18:42:00Z".into(),
+        ))
+        .unwrap();
+        tx.send(Request::Shutdown).unwrap();
+        run(
+            dir.path(),
+            requests,
+            events,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let config = clip_store::read_config(dir.path()).unwrap();
+        assert_eq!(config.volume, 32.0);
+        assert!(config.muted);
+        let state = clip_store::media_state(&clip_store::read_history(dir.path()).unwrap(), &path);
+        assert!(state.watched_at.is_empty());
+        assert_eq!(state.track_gains.get(&1), Some(&0.4));
+    }
     #[test]
     fn preserves_nested_folders_and_deduplicates_roots() {
         let root = tempfile::tempdir().unwrap();
@@ -584,8 +995,8 @@ mod tests {
                 .unwrap()
                 && !history.is_empty()
             {
-                assert_eq!(history.len(), 1);
-                assert_eq!(history.values().next().unwrap(), &timestamp);
+                assert_eq!(history.len(), 2);
+                assert!(history.values().all(|state| state.watched_at == timestamp));
                 break;
             }
         }
@@ -596,7 +1007,7 @@ mod tests {
             if let Event::History(history) = rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap()
-                && history.is_empty()
+                && history.values().any(|state| state.watched_at.is_empty())
             {
                 break;
             }
@@ -607,6 +1018,13 @@ mod tests {
             clip_store::read_config(&store).unwrap().clip_discovery,
             Discovery::Declined
         );
-        assert!(clip_store::read_history(&store).unwrap().is_empty());
+        assert_eq!(
+            clip_store::read_history(&store)
+                .unwrap()
+                .values()
+                .filter(|s| !s.watched_at.is_empty())
+                .count(),
+            1
+        );
     }
 }

@@ -6,7 +6,7 @@ mod platform {
     use std::{cell::Cell, sync::OnceLock};
     use windows_sys::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
-        Graphics::Gdi::{BLACK_BRUSH, GetStockObject, UpdateWindow, InvalidateRect},
+        Graphics::Gdi::{BLACK_BRUSH, GetStockObject, InvalidateRect, UpdateWindow},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},

@@ -15,6 +15,11 @@ impl<T> Default for History<T> {
 }
 
 impl<T> History<T> {
+    pub fn update(&mut self, mut update: impl FnMut(&mut T)) {
+        for view in self.back.iter_mut().chain(self.forward.iter_mut()) {
+            update(view);
+        }
+    }
     pub fn visit(&mut self, current: T) {
         self.back.push(current);
         self.forward.clear();
@@ -87,6 +92,24 @@ pub fn near_edge(x: f32, y: f32, width: f32, height: f32) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_includes_folders_and_rewrites_renamed_targets() {
+        let mut history = History::default();
+        history.visit("root".to_owned());
+        history.visit("folder".to_owned());
+        history.visit("nested".to_owned());
+        assert_eq!(history.back("old.mp4".into()), Some("nested".into()));
+        history.update(|view| {
+            if view == "old.mp4" {
+                *view = "new.mp4".into();
+            }
+        });
+        assert_eq!(history.back("nested".into()), Some("folder".into()));
+        assert_eq!(history.back("folder".into()), Some("root".into()));
+        assert_eq!(history.forward("root".into()), Some("folder".into()));
+        assert_eq!(history.forward("folder".into()), Some("nested".into()));
+        assert_eq!(history.forward("nested".into()), Some("new.mp4".into()));
+    }
 
     #[test]
     fn navigation_is_revealed_only_near_the_middle_of_each_edge() {

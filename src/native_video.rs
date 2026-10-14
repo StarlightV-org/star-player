@@ -54,7 +54,12 @@ impl NativeVideo {
     #[cfg(all(test, windows))]
     pub fn backdrop_size(&self) -> [i32; 2] {
         let mut rect = unsafe { std::mem::zeroed() };
-        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(self._backdrop.hwnd(), &mut rect); }
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(
+                self._backdrop.hwnd(),
+                &mut rect,
+            );
+        }
         [rect.right, rect.bottom]
     }
 

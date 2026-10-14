@@ -55,7 +55,9 @@ Directories are watched recursively. A startup scan and periodic reconciliation
 also catch offline changes and reconnected drives. Directory links are not followed.
 Only recognized video extensions are listed; screenshots and audio-only files
 remain accessible through **Open file**. Thumbnails use the bundled decoder,
-load on demand, and cache in `.spacer/thumbnails`.
+load on demand, and cache in `.spacer/thumbnails`. The disk cache is limited to
+2,000,000 bytes. Startup and new writes remove the oldest generated thumbnails
+first; evicted thumbnails are regenerated when needed.
 
 Click a clip row without modifiers to open the separate player. Use the checkboxes
 to select clips, Ctrl-click to toggle selection, or Shift-click for a range.
@@ -64,6 +66,8 @@ move through the original folder list; hover to preview the destination. Navigat
 does not wrap or cross folders. Deleted entries are skipped, and new recordings
 enter the list after returning to the library. **Library** restores the folder,
 selection, and scroll position.
+Escape clears the list selection and its range-selection anchor. Returning to
+the library exits fullscreen; minimizing or switching applications does not.
 
 Files opened with **Open file**, Ctrl+O, or a command-line path also support
 Previous/Next. Their queue contains videos in the same directory, sorted by
@@ -71,12 +75,25 @@ filename, without scanning subdirectories or adding the directory to the library
 Each edge button appears only when the cursor is near it and a destination exists.
 
 Playback beginning marks a clip watched. `.spacer/watched.csv` contains
-`sha256,watched_at` records with SHA-256 hashes of filenames and UTC timestamps.
+`sha256,identity_version,watched_at,track_gains` records with UTC watched timestamps
+and a JSON map of audio-track IDs to gains. An empty timestamp means unwatched,
+without discarding saved audio settings. SHA-256 identity combines the immediate
+parent folder name and full filename as separate fields. For example,
+`Desktop/clip.mp4` and `Game/clip.mp4` have different identities, while matching
+folder names and filenames under different root paths still share state.
 Watched checks do not read video contents or wait for thumbnails. Files with the
-same filename share watched status, even in different folders. Moving a file
-preserves its status; renaming it changes its identity. Existing content-hash
-records from earlier versions do not match the filename hashes.
+same identity share watched status and track settings. Moving a file between
+different folder names changes its identity. Existing two-column filename-hash
+records remain readable and migrate as corresponding paths become known. Legacy
+rows remain available for offline folders. Older content-hash records cannot be
+matched without reading media contents and are retained without reinterpretation.
 Bulk **Mark watched** and **Mark unwatched** update the same history.
+
+Use **Rename** on a clip row or in the player to edit the filename stem while
+keeping its extension. Renaming transfers watched status and track settings to
+the new hash, updates navigation and selection, and restores an open player's
+position and pause state. Existing destinations are never overwritten. A settings
+save failure attempts to roll back the rename and reports any incomplete recovery.
 
 Bulk **Delete** and the Delete key ask for confirmation before moving clips to
 the Windows Recycle Bin. Failures are reported without permanently deleting files.
@@ -97,7 +114,14 @@ Pinned build:
 
 The embedded build handles common formats such as MP4/M4V, MKV, MOV, AVI, WebM, MPEG/TS, WMV, FLV, Ogg, MP3, AAC/M4A, FLAC, WAV, and Opus. Support depends on the codecs included in that build. Encrypted media, DRM-protected streams, damaged files, and every codec variant are not guaranteed.
 
-Audio-only files are supported. Embedded audio tracks each have an independent gain slider and are mixed into one synchronized output. All tracks start at 100% and play together. Gains are not normalized, so loud tracks can clip when mixed. Lower track gains to leave headroom. Gain changes update the running filters without restarting playback. External audio-file attachment is not implemented.
+Audio-only files are supported. Embedded audio tracks each have an independent
+gain slider and are mixed into one synchronized output. New tracks start at 100%.
+Saved per-file gains, including zero-gain disabled tracks, are restored before the
+initial audio mix. Master volume and mute are global and saved in `config.json`.
+Slider writes are debounced and pending settings flush when leaving media or
+closing. Gains are not normalized, so loud tracks can clip when mixed. Lower track
+gains to leave headroom. Gain changes update the running filters without restarting
+playback. External audio-file attachment is not implemented.
 
 ## Controls
 
@@ -106,8 +130,9 @@ window. A double-click does not also toggle playback; single clicks wait for the
 Windows double-click interval. The fullscreen button and F still toggle actual
 fullscreen.
 
-The mouse's Back/Forward side buttons retrace visited library and video views,
-like browser history. Opening another video after going Back clears the forward
+The mouse's Back/Forward side buttons retrace visited folders, library and video
+views, like browser history. Library entries restore their folder, selection and
+scroll offset. Opening another folder or video after going Back clears the forward
 history. These buttons do not seek or step through the folder's video list.
 
 | Action                           | Shortcut                      |
@@ -264,6 +289,7 @@ cargo fmt -- --check
 cargo test software_60fps_render_throughput -- --ignored
 cargo test native_gpu_playback_steps_and_60fps_throughput -- --ignored
 cargo test opaque_background_survives_video_transitions -- --ignored
+cargo test library_history_rename_audio_and_fullscreen -- --ignored --test-threads=1
 ```
 
 Tests exercise the actual embedded decoder using video/audio fixtures written in Rust. No ffmpeg or system-installed decoder is needed for the tests. They cover software-rendered frame pixels, paused forward/backward stepping, simultaneous audio-track selection and gain configuration, seek and file-replacement races, preview decoding and cancellation, and extraction integrity. Audio tests use null output; physical-device output and audible mix quality still need listening tests.
@@ -293,6 +319,11 @@ Manual release checks still required:
 
 These manual checks are not claimed as completed. Native texture sharing,
 background media sessions, DRM and non-Windows packaging remain out of scope.
+
+The isolated-store desktop regression test covers folder Back/Forward, Escape
+deselection, renaming an open file with saved gains and a paused position, updated
+history paths, and exiting fullscreen when returning to the library. It does not
+replace listening tests or compressed-format and multi-monitor checks.
 
 A GPUI-window visual check with a generated blue AVI confirmed that native video
 and a hover thumbnail are visible after the composition fix. This does not

@@ -8,6 +8,7 @@ use gpui_kit::{
         ActiveTheme as _, Icon, IconName, WindowExt,
         button::{Button, ButtonVariants},
         checkbox::Checkbox,
+        input::{Input, InputState},
     },
     prelude::FluentBuilder as _,
     *,
@@ -24,6 +25,28 @@ pub enum BrowserEvent {
     Play(PathBuf, Vec<PathBuf>),
     Delete(Vec<PathBuf>),
     Open,
+    Navigate(BrowserView),
+    Rename(PathBuf, String),
+    Renamed(PathBuf, PathBuf),
+    RenameFailed(PathBuf, String),
+    Error(String),
+}
+#[derive(Clone)]
+pub struct BrowserView {
+    folder: Option<PathBuf>,
+    selected: HashSet<PathBuf>,
+    anchor: Option<PathBuf>,
+    offset: Point<Pixels>,
+}
+impl BrowserView {
+    pub fn rename(&mut self, old: &Path, new: &Path) {
+        if self.selected.remove(old) {
+            self.selected.insert(new.to_owned());
+        }
+        if self.anchor.as_deref() == Some(old) {
+            self.anchor = Some(new.to_owned());
+        }
+    }
 }
 #[derive(Clone)]
 enum Row {
@@ -49,14 +72,39 @@ pub struct ClipBrowser {
     focus: FocusHandle,
     prompt_on_start: bool,
     config_ready: bool,
+    history_ready: bool,
+    audio_overrides: HashMap<String, std::collections::BTreeMap<i64, f64>>,
     error: Option<String>,
 }
 impl EventEmitter<BrowserEvent> for ClipBrowser {}
 
 impl ClipBrowser {
     pub fn new(prompt_on_start: bool, cx: &mut Context<Self>) -> Self {
+        Self::with_worker(prompt_on_start, LibraryWorker::new(), cx)
+    }
+    #[cfg(test)]
+    pub fn for_test(directory: PathBuf, cx: &mut Context<Self>) -> Self {
+        Self::with_worker(false, LibraryWorker::for_test(directory), cx)
+    }
+    #[cfg(test)]
+    pub fn test_navigate(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.navigate(folder, cx);
+    }
+    #[cfg(test)]
+    pub fn test_select(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.select(path, &Modifiers::default(), true, cx);
+    }
+    #[cfg(test)]
+    pub fn test_location(&self) -> Option<PathBuf> {
+        self.folder.clone()
+    }
+    #[cfg(test)]
+    pub fn test_selection_empty(&self) -> bool {
+        self.selected.is_empty() && self.anchor.is_none()
+    }
+    fn with_worker(prompt_on_start: bool, worker: LibraryWorker, cx: &mut Context<Self>) -> Self {
         Self {
-            worker: LibraryWorker::new(),
+            worker,
             config: Config::default(),
             catalog: Catalog::default(),
             history: History::new(),
@@ -73,6 +121,8 @@ impl ClipBrowser {
             focus: cx.focus_handle(),
             prompt_on_start,
             config_ready: false,
+            history_ready: false,
+            audio_overrides: HashMap::new(),
             error: None,
         }
     }
@@ -105,7 +155,44 @@ impl ClipBrowser {
                         .retain(|p| self.catalog.clips.iter().any(|c| c.path == *p));
                     self.rebuild();
                 }
-                Event::History(history) => self.history = history,
+                Event::History(history) => {
+                    self.audio_overrides.retain(|key, gains| {
+                        !history
+                            .get(key)
+                            .is_some_and(|state| &state.track_gains == gains)
+                    });
+                    self.history = history;
+                    self.history_ready = true;
+                }
+                Event::Renamed(old, new) => {
+                    let mut view = self.view();
+                    view.rename(&old, &new);
+                    self.selected = view.selected;
+                    self.anchor = view.anchor;
+                    self.thumbnails.remove(&old);
+                    self.requested.retain(|(path, _)| path != &old);
+                    if let (Ok(old_hash), Ok(new_hash)) = (
+                        crate::clip_store::hash_filename(&old),
+                        crate::clip_store::hash_filename(&new),
+                    ) {
+                        if let Some(gains) = self.audio_overrides.remove(&old_hash) {
+                            self.audio_overrides.insert(new_hash, gains);
+                        }
+                    }
+                    for clip in &mut self.catalog.clips {
+                        if clip.path == old {
+                            clip.path = new.clone();
+                        }
+                    }
+                    self.rebuild();
+                    if let Some(value) = self.pending_watched.remove(&old) {
+                        self.pending_watched.insert(new.clone(), value);
+                    }
+                    cx.emit(BrowserEvent::Renamed(old, new));
+                }
+                Event::RenameFailed(path, error) => {
+                    cx.emit(BrowserEvent::RenameFailed(path, error));
+                }
                 Event::WatchedComplete(paths) => {
                     for path in paths {
                         self.pending_watched.remove(&path);
@@ -131,6 +218,7 @@ impl ClipBrowser {
                 }
                 Event::Error(error) => {
                     crate::logging::Print(crate::logging::Level::Warn, &error);
+                    cx.emit(BrowserEvent::Error(error.clone()));
                     self.error = Some(error);
                 }
             }
@@ -218,6 +306,10 @@ impl ClipBrowser {
     }
 
     fn navigate(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.folder == folder {
+            return;
+        }
+        cx.emit(BrowserEvent::Navigate(self.view()));
         self.offsets
             .insert(self.folder.clone(), self.scroll.offset());
         self.folder = folder;
@@ -230,6 +322,125 @@ impl ClipBrowser {
     }
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         window.focus(&self.focus, cx);
+    }
+    pub fn deselect(&mut self, cx: &mut Context<Self>) {
+        self.selected.clear();
+        self.anchor = None;
+        cx.notify();
+    }
+    pub fn view(&self) -> BrowserView {
+        BrowserView {
+            folder: self.folder.clone(),
+            selected: self.selected.clone(),
+            anchor: self.anchor.clone(),
+            offset: self.scroll.offset(),
+        }
+    }
+    pub fn restore(&mut self, view: BrowserView, cx: &mut Context<Self>) {
+        self.offsets
+            .insert(self.folder.clone(), self.scroll.offset());
+        self.folder = view
+            .folder
+            .filter(|folder| self.catalog.folders.contains(folder));
+        self.selected = view
+            .selected
+            .into_iter()
+            .filter(|path| self.exists(path))
+            .collect();
+        self.anchor = view.anchor.filter(|path| self.exists(path));
+        self.rebuild();
+        self.scroll.set_offset(view.offset);
+        cx.notify();
+    }
+    pub fn audio_ready(&self) -> bool {
+        self.config_ready && self.history_ready
+    }
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+    pub fn media_state(&self, path: &Path) -> crate::clip_store::MediaState {
+        let mut state = crate::clip_store::media_state(&self.history, path);
+        if let Some(gains) = crate::clip_store::hash_filename(path)
+            .ok()
+            .and_then(|key| self.audio_overrides.get(&key))
+        {
+            state.track_gains = gains.clone();
+        }
+        state
+    }
+    pub fn save_audio(&mut self, path: PathBuf, gains: std::collections::BTreeMap<i64, f64>) {
+        if let Ok(hash) = crate::clip_store::hash_filename(&path) {
+            let mut state = self.media_state(&path);
+            state.track_gains = gains.clone();
+            self.history.insert(hash, state);
+            if let Ok(hash) = crate::clip_store::hash_filename(&path) {
+                self.audio_overrides.insert(hash, gains.clone());
+            }
+        }
+        self.worker.send(Request::Audio(path, gains));
+    }
+    pub fn save_master(&mut self, volume: f64, muted: bool) {
+        self.config.volume = volume;
+        self.config.muted = muted;
+        self.worker.send(Request::Master(volume, muted));
+    }
+    pub fn rename(
+        &self,
+        path: PathBuf,
+        stem: String,
+        released: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.worker.send(Request::Rename(path, stem, released));
+    }
+    pub fn prompt_rename(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(stem));
+        let owner = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let input = input.clone();
+            let owner = owner.clone();
+            let path = path.clone();
+            let field = input.clone();
+            dialog
+                .title("Rename file")
+                .child(Input::new(&field))
+                .footer(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("rename-confirm")
+                                .primary()
+                                .label("Rename")
+                                .on_click(move |_, window, cx| {
+                                    let stem = input.read(cx).value().to_string();
+                                    match crate::clip_library::rename_destination(&path, &stem) {
+                                        Ok(_) => {
+                                            let _ = owner.update(cx, |_, cx| {
+                                                cx.emit(BrowserEvent::Rename(
+                                                    path.clone(),
+                                                    stem.clone(),
+                                                ))
+                                            });
+                                            window.close_dialog(cx);
+                                        }
+                                        Err(error) => {
+                                            window.push_notification(error, cx);
+                                        }
+                                    }
+                                }),
+                        )
+                        .child(Button::new("rename-cancel").label("Cancel").on_click(
+                            |_, window, cx| {
+                                window.close_dialog(cx);
+                            },
+                        )),
+                )
+        });
     }
     pub fn mark_played(&mut self, path: PathBuf) {
         self.pending_watched.insert(path.clone(), true);
@@ -409,16 +620,18 @@ impl ClipBrowser {
                 self.request_thumbnail(&clip);
                 let path = clip.path.clone();
                 let selected = self.selected.contains(&path);
-                let watched = self.pending_watched.get(&path).copied().unwrap_or_else(|| {
-                    crate::clip_store::hash_filename(&path)
-                        .is_ok_and(|hash| self.history.contains_key(&hash))
-                });
+                let watched = self
+                    .pending_watched
+                    .get(&path)
+                    .copied()
+                    .unwrap_or_else(|| !self.media_state(&path).watched_at.is_empty());
                 let thumbnail = self
                     .thumbnails
                     .get(&path)
                     .and_then(|(_, image)| image.clone());
                 let check_path = path.clone();
                 let play_path = path.clone();
+                let rename_path = path.clone();
                 div()
                     .id(SharedString::from(format!("clip:{}", path.display())))
                     .w_full()
@@ -433,7 +646,13 @@ impl ClipBrowser {
                     .hover(|s| s.bg(cx.theme().muted))
                     .child(
                         div()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .child(
                                 Checkbox::new(("select-clip", index))
                                     .checked(selected)
@@ -484,6 +703,18 @@ impl ClipBrowser {
                                 .child("Unwatched"),
                         )
                     })
+                    .child(
+                        div()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new(("rename-clip", index))
+                                    .ghost()
+                                    .label("Rename")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.prompt_rename(rename_path.clone(), window, cx)
+                                    })),
+                            ),
+                    )
                     .child(
                         Button::new(("play-clip", index))
                             .ghost()
@@ -545,6 +776,11 @@ impl Render for ClipBrowser {
                         })
                         .collect();
                     cx.notify();
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "escape"
+                    && event.keystroke.modifiers == Modifiers::default()
+                {
+                    this.deselect(cx);
                     cx.stop_propagation();
                 } else if event.keystroke.key == "delete" {
                     this.confirm_delete(window, cx);
@@ -748,6 +984,22 @@ mod tests {
     use super::{Row, folder_row, opens_clip};
     use crate::clip_library::{Catalog, scan};
     use gpui_kit::Modifiers;
+    #[test]
+    fn renaming_a_history_view_updates_selection_and_anchor() {
+        let old = std::path::PathBuf::from("Game/old.mp4");
+        let new = std::path::PathBuf::from("Game/new.mp4");
+        let mut view = super::BrowserView {
+            folder: Some("Game".into()),
+            selected: std::collections::HashSet::from([old.clone()]),
+            anchor: Some(old.clone()),
+            offset: gpui_kit::point(gpui_kit::px(0.0), gpui_kit::px(-88.0)),
+        };
+        view.rename(&old, &new);
+        assert!(view.selected.contains(&new));
+        assert!(!view.selected.contains(&old));
+        assert_eq!(view.anchor, Some(new));
+        assert_eq!(view.offset.y, gpui_kit::px(-88.0));
+    }
 
     #[test]
     fn plain_click_opens_clip_but_modified_click_does_not() {

@@ -201,8 +201,18 @@ pub struct VideoFrame {
 }
 
 #[derive(Clone, Debug)]
+pub struct LoadState {
+    pub volume: f64,
+    pub muted: bool,
+    pub gains: std::collections::BTreeMap<i64, f64>,
+    pub position: f64,
+    pub paused: bool,
+}
+
+#[derive(Clone, Debug)]
 pub enum Command {
     Load(PathBuf),
+    LoadSaved(PathBuf, LoadState),
     Toggle,
     Play,
     Pause,
@@ -581,6 +591,9 @@ struct Player {
     waiting_for_seek: bool,
     intended_paused: bool,
     fatal_error: Option<String>,
+    next_load: Option<LoadState>,
+    saved_gains: std::collections::BTreeMap<i64, f64>,
+    resume_position: Option<f64>,
 }
 
 impl Player {
@@ -634,6 +647,9 @@ impl Player {
             waiting_for_seek: false,
             intended_paused: true,
             fatal_error: None,
+            next_load: None,
+            saved_gains: Default::default(),
+            resume_position: None,
         };
         for (name, value) in [
             ("vo", "libmpv"),
@@ -903,7 +919,19 @@ impl Player {
             return Ok(());
         }
         let value = self.property_node("track-list")?;
-        let tracks = audio_tracks(&value, &self.state.tracks);
+        let mut tracks = audio_tracks(&value, &self.state.tracks);
+        for track in &mut tracks {
+            if !self
+                .state
+                .tracks
+                .iter()
+                .any(|previous| previous.id == track.id)
+            {
+                if let Some(gain) = self.saved_gains.get(&track.id) {
+                    track.gain = *gain;
+                }
+            }
+        }
         let changed = tracks
             .iter()
             .map(|t| t.id)
@@ -920,7 +948,15 @@ impl Player {
     fn execute(&mut self, command: Command) -> Result<(), String> {
         Print(Level::Debug, format!("Playback command {command:?}"));
         match command {
+            Command::LoadSaved(path, state) => {
+                finite_range(state.volume, 0.0, 100.0, "Master volume")?;
+                finite_range(state.position, 0.0, f64::MAX, "Resume position")?;
+                crate::clip_store::validate_gains(&state.gains)?;
+                self.next_load = Some(state);
+                self.execute(Command::Load(path))
+            }
             Command::Load(path) => {
+                let saved = self.next_load.take();
                 let requested_path = path.clone();
                 let path = std::fs::canonicalize(&path)
                     .map_err(|e| format!("Open {}: {e}", path.display()))?;
@@ -936,8 +972,20 @@ impl Player {
                 self.frame_ready = false;
                 self.set("lavfi-complex", "")?;
                 self.set("af", "")?;
-                self.set_paused(false)?;
                 self.state.tracks.clear();
+                self.saved_gains = saved
+                    .as_ref()
+                    .map(|state| state.gains.clone())
+                    .unwrap_or_default();
+                self.resume_position = saved
+                    .as_ref()
+                    .map(|state| state.position)
+                    .filter(|p| *p > 0.0);
+                if let Some(state) = &saved {
+                    self.execute(Command::SetVolume(state.volume))?;
+                    self.execute(Command::SetMute(state.muted))?;
+                }
+                self.set_paused(saved.as_ref().is_some_and(|state| state.paused))?;
                 self.state.error = None;
                 self.fatal_error = None;
                 self.state.clear_diagnostics();
@@ -1184,6 +1232,13 @@ impl Player {
                     self.media_ready = true;
                     if let Err(error) = self.tracks() {
                         self.state.error = Some(error);
+                    }
+                    if let Some(position) = self.resume_position.take() {
+                        if let Err(error) =
+                            self.seek_command(&["seek", &position.to_string(), "absolute+exact"])
+                        {
+                            self.state.error = Some(error);
+                        }
                     }
                 }
                 20 => {
@@ -2030,6 +2085,67 @@ mod tests {
         assert_eq!(render_size(64, 48, (1920_u64 << 32) | 1080), (64, 48));
         assert_eq!(render_size(7680, 4320, 0), (3840, 2160));
         assert_eq!(render_size(0, 0, 0), (0, 0));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn saved_audio_is_applied_during_load_and_paused_position_is_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("saved-audio.avi");
+        test_fixtures::avi(&path, 2, false);
+        let mut player =
+            Player::new_with_options(Arc::new(Mailbox::new()), &[("ao", "null")]).unwrap();
+        player.execute(Command::Load(path.clone())).unwrap();
+        smoke_wait(&mut player, "initial tracks", |p| p.state.tracks.len() == 2);
+        let first = player.state.tracks[0].id;
+        let second = player.state.tracks[1].id;
+        let gains = std::collections::BTreeMap::from([(first, 0.35), (second, 0.0), (999, 0.8)]);
+        player
+            .execute(Command::LoadSaved(
+                path.clone(),
+                LoadState {
+                    volume: 28.0,
+                    muted: true,
+                    gains,
+                    position: 1.0,
+                    paused: true,
+                },
+            ))
+            .unwrap();
+        smoke_wait(&mut player, "saved paused load", |p| {
+            p.frame_ready && (p.state.position - 1.0).abs() < 0.11 && p.state.tracks.len() == 2
+        });
+        assert_eq!(player.state.volume, 28.0);
+        assert!(player.state.muted);
+        assert!(player.intended_paused);
+        assert_eq!(
+            player
+                .state
+                .tracks
+                .iter()
+                .map(|t| t.gain)
+                .collect::<Vec<_>>(),
+            [0.35, 0.0]
+        );
+        let filter = player.property_node("af").unwrap().to_string();
+        assert!(filter.contains("0.35"));
+        player
+            .execute(Command::LoadSaved(
+                path,
+                LoadState {
+                    volume: 28.0,
+                    muted: false,
+                    gains: Default::default(),
+                    position: 0.0,
+                    paused: true,
+                },
+            ))
+            .unwrap();
+        smoke_wait(&mut player, "default gains on another load", |p| {
+            p.frame_ready && p.state.tracks.len() == 2
+        });
+        assert!(player.state.tracks.iter().all(|t| t.gain == 1.0));
+        assert!(!player.state.muted);
     }
 
     #[test]

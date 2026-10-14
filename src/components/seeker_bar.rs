@@ -61,6 +61,12 @@ impl SeekerBar {
         self.previews.release()
     }
 
+    pub fn suspend_previews(&mut self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.path = None;
+        self.generation += 1;
+        self.release_previews()
+    }
+
     pub fn sync(&mut self, position: f64, duration: f64, cx: &mut Context<Self>) {
         self.position = position;
         self.duration = duration;
