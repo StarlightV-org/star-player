@@ -902,6 +902,7 @@ impl Player {
             .ne(self.state.tracks.iter().map(|t| t.id));
         if changed {
             // Commit gains only after mpv accepts the new graph.
+            self.set("af", &gain_filter(&tracks)?)?;
             self.set("lavfi-complex", &mix_graph(&tracks)?)?;
         }
         self.state.tracks = tracks;
@@ -925,6 +926,7 @@ impl Player {
                 self.media_ready = false;
                 self.frame_ready = false;
                 self.set("lavfi-complex", "")?;
+                self.set("af", "")?;
                 self.set_paused(false)?;
                 self.state.tracks.clear();
                 self.state.error = None;
@@ -1030,14 +1032,23 @@ impl Player {
             }
             Command::SetTrackGain { id, gain } => {
                 finite_range(gain, 0.0, 10.0, "Track gain")?;
-                let mut tracks = self.state.tracks.clone();
-                tracks
-                    .iter_mut()
-                    .find(|t| t.id == id)
-                    .ok_or_else(|| format!("Unknown audio track {id}"))?
-                    .gain = gain;
-                self.set("lavfi-complex", &mix_graph(&tracks)?)?;
-                self.state.tracks = tracks;
+                let index = self
+                    .state
+                    .tracks
+                    .iter()
+                    .position(|t| t.id == id)
+                    .ok_or_else(|| format!("Unknown audio track {id}"))?;
+                if self.state.tracks[index].gain == gain {
+                    return Ok(());
+                }
+                self.command(&[
+                    "af-command",
+                    "track-gains",
+                    "volume",
+                    &gain.to_string(),
+                    &format!("volume@track{id}"),
+                ])?;
+                self.state.tracks[index].gain = gain;
                 Ok(())
             }
             Command::Shutdown => Ok(()),
@@ -1546,7 +1557,7 @@ fn audio_tracks(value: &serde_json::Value, previous: &[AudioTrack]) -> Vec<Audio
                 .iter()
                 .find(|t| t.id == id)
                 .map(|t| t.gain)
-                .unwrap_or(if tracks.is_empty() { 1.0 } else { 0.0 });
+                .unwrap_or(1.0);
             let title = entry["title"]
                 .as_str()
                 .filter(|s| !s.is_empty())
@@ -1569,9 +1580,16 @@ fn mix_graph(tracks: &[AudioTrack]) -> Result<String, String> {
         }
         finite_range(track.gain, 0.0, 10.0, "Track gain")?;
         if tracks.len() == 1 {
-            let _ = write!(graph, "[aid{}]volume={}[ao]", track.id, track.gain);
+            let _ = write!(graph, "[aid{}]anull[ao]", track.id);
         } else {
-            let _ = write!(graph, "[aid{}]volume={}[mix{index}];", track.id, track.gain);
+            let _ = write!(
+                graph,
+                "[aid{}]aformat=channel_layouts=stereo,pan={}c|c{}=c0|c{}=c1[mix{index}];",
+                track.id,
+                tracks.len() * 2,
+                index * 2,
+                index * 2 + 1
+            );
         }
     }
     if tracks.len() > 1 {
@@ -1585,6 +1603,46 @@ fn mix_graph(tracks: &[AudioTrack]) -> Result<String, String> {
         );
     }
     Ok(graph)
+}
+
+// Keep each stereo input separate until the commandable output filter applies
+// its gain. Changing lavfi-complex would restart playback, even for gain alone.
+fn gain_filter(tracks: &[AudioTrack]) -> Result<String, String> {
+    use std::fmt::Write;
+    mix_graph(tracks)?;
+    if tracks.is_empty() {
+        return Ok(String::new());
+    }
+    let mut graph = String::new();
+    if tracks.len() == 1 {
+        let track = &tracks[0];
+        let _ = write!(graph, "volume@track{}={}", track.id, track.gain);
+    } else {
+        let _ = write!(graph, "asplit={}", tracks.len());
+        for index in 0..tracks.len() {
+            let _ = write!(graph, "[input{index}]");
+        }
+        graph.push(';');
+        for (index, track) in tracks.iter().enumerate() {
+            let _ = write!(
+                graph,
+                "[input{index}]pan=stereo|c0=c{}|c1=c{},volume@track{}={}[mix{index}];",
+                index * 2,
+                index * 2 + 1,
+                track.id,
+                track.gain
+            );
+        }
+        for index in 0..tracks.len() {
+            let _ = write!(graph, "[mix{index}]");
+        }
+        let _ = write!(
+            graph,
+            "amix=inputs={}:duration=longest:dropout_transition=0:normalize=0",
+            tracks.len()
+        );
+    }
+    Ok(format!("@track-gains:lavfi=[{graph}]"))
 }
 
 /// Small indexed AVI fixtures, generated without tools or checked-in binaries.
@@ -2285,16 +2343,28 @@ mod tests {
     #[test]
     fn empty_graph_disables_complex_filter() {
         assert_eq!(mix_graph(&[]).unwrap(), "");
+        assert_eq!(gain_filter(&[]).unwrap(), "");
+    }
+    #[test]
+    fn input_graph_does_not_depend_on_track_gains() {
+        assert_eq!(
+            mix_graph(&[track(1, 1.0), track(7, 0.0)]).unwrap(),
+            mix_graph(&[track(1, 0.2), track(7, 0.8)]).unwrap()
+        );
     }
     #[test]
     fn single_track_still_applies_gain() {
-        assert_eq!(mix_graph(&[track(3, 0.5)]).unwrap(), "[aid3]volume=0.5[ao]");
+        assert_eq!(mix_graph(&[track(3, 0.5)]).unwrap(), "[aid3]anull[ao]");
+        assert_eq!(
+            gain_filter(&[track(3, 0.5)]).unwrap(),
+            "@track-gains:lavfi=[volume@track3=0.5]"
+        );
     }
     #[test]
     fn mixes_all_tracks_without_normalizing_or_dropping_muted_inputs() {
         assert_eq!(
-            mix_graph(&[track(1, 1.0), track(7, 0.0)]).unwrap(),
-            "[aid1]volume=1[mix0];[aid7]volume=0[mix1];[mix0][mix1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[ao]"
+            gain_filter(&[track(1, 1.0), track(7, 0.0)]).unwrap(),
+            "@track-gains:lavfi=[asplit=2[input0][input1];[input0]pan=stereo|c0=c0|c1=c1,volume@track1=1[mix0];[input1]pan=stereo|c0=c2|c1=c3,volume@track7=0[mix1];[mix0][mix1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0]"
         );
     }
     #[test]
@@ -2307,7 +2377,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_first_audio_only_and_preserves_individual_gains() {
+    fn defaults_all_audio_on_and_preserves_individual_gains() {
         let value = serde_json::json!([
             {"type":"video", "id":1},
             {"type":"audio", "id":3, "title":"Commentary"},
@@ -2317,10 +2387,15 @@ mod tests {
         let tracks = audio_tracks(&value, &[]);
         assert_eq!(
             tracks.iter().map(|t| (t.id, t.gain)).collect::<Vec<_>>(),
-            vec![(3, 1.0), (8, 0.0)]
+            vec![(3, 1.0), (8, 1.0)]
         );
         assert_eq!(tracks[0].title, "Commentary");
         assert_eq!(tracks[1].title, "eng");
+        let tracks = audio_tracks(&value, &[track(3, 0.0)]);
+        assert_eq!(
+            tracks.iter().map(|t| t.gain).collect::<Vec<_>>(),
+            vec![0.0, 1.0]
+        );
         let tracks = audio_tracks(&value, &[track(3, 0.25), track(8, 0.75)]);
         assert_eq!(
             tracks.iter().map(|t| t.gain).collect::<Vec<_>>(),
@@ -2429,6 +2504,54 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn track_gain_changes_do_not_restart_playback() {
+        let directory = tempfile::tempdir().unwrap();
+        for count in [1, 2] {
+            let path = directory.path().join(format!("{count}-tracks.avi"));
+            test_fixtures::avi(&path, count, false);
+            let mut player =
+                Player::new_with_options(Arc::new(Mailbox::new()), &[("ao", "null")]).unwrap();
+            player.execute(Command::Load(path)).unwrap();
+            smoke_wait(&mut player, "playing audio and video", |p| {
+                p.frame_ready && p.state.tracks.len() == count && p.state.position > 0.3
+            });
+            let graph = player.property_node("lavfi-complex").unwrap();
+            let filters = player.property_node("af").unwrap();
+            let before = player.state.position;
+            let ids = player.state.tracks.iter().map(|t| t.id).collect::<Vec<_>>();
+            for step in 0..20 {
+                for &id in &ids {
+                    player
+                        .execute(Command::SetTrackGain {
+                            id,
+                            gain: step as f64 / 20.0,
+                        })
+                        .unwrap();
+                }
+                thread::sleep(Duration::from_millis(20));
+                loop {
+                    let event = unsafe { &*(player.api.wait)(player.handle, 0.0) };
+                    if event.id == 0 {
+                        break;
+                    }
+                    assert!(
+                        !matches!(event.id, 20 | 21),
+                        "Gain adjustment caused seek/restart event {}",
+                        event.id
+                    );
+                }
+                assert_eq!(player.flag("pause"), Some(false));
+                assert_eq!(player.flag("seeking"), Some(false));
+            }
+            player.refresh();
+            assert!(player.state.position > before + 0.2);
+            assert_eq!(player.property_node("lavfi-complex").unwrap(), graph);
+            assert_eq!(player.property_node("af").unwrap(), filters);
+        }
+    }
+
     /// Uses bundled libmpv and a null audio device. Asserts graph readback,
     /// both selected audio inputs and decoding, not physical acoustic output.
     #[test]
@@ -2461,7 +2584,7 @@ mod tests {
                 .iter()
                 .map(|t| t.gain)
                 .collect::<Vec<_>>(),
-            vec![1.0, 0.0]
+            vec![1.0, 1.0]
         );
         let frame = mailbox.frame.lock().unwrap().take().unwrap();
         assert_eq!((frame.width, frame.height), (64, 48));
@@ -2600,7 +2723,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             player.property_node("lavfi-complex").unwrap().as_str(),
-            Some(format!("[aid{id}]volume=0.25[ao]").as_str())
+            Some(format!("[aid{id}]anull[ao]").as_str())
         );
         // Exercise reload after a gain change, then keep the single-track slider.
         player.execute(Command::Stop).unwrap();

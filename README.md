@@ -43,7 +43,7 @@ Pinned build:
 
 The embedded build handles common formats such as MP4/M4V, MKV, MOV, AVI, WebM, MPEG/TS, WMV, FLV, Ogg, MP3, AAC/M4A, FLAC, WAV, and Opus. Support depends on the codecs included in that build. Encrypted media, DRM-protected streams, damaged files, and every codec variant are not guaranteed.
 
-Audio-only files are supported. Embedded audio tracks each have an independent gain slider and are mixed into one synchronized output. The first track starts at 100%; the rest start at 0%. Raising another slider plays it alongside the first. Gains are not normalized, so loud tracks can clip when mixed. Lower track gains to leave headroom. Changing gains rebuilds the audio graph and may briefly interrupt audio. External audio-file attachment is not implemented.
+Audio-only files are supported. Embedded audio tracks each have an independent gain slider and are mixed into one synchronized output. All tracks start at 100% and play together. Gains are not normalized, so loud tracks can clip when mixed. Lower track gains to leave headroom. Gain changes update the running filters without restarting playback. External audio-file attachment is not implemented.
 
 ## Controls
 
