@@ -17,6 +17,63 @@ pub enum Discovery {
     Declined,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RememberPlayback {
+    #[serde(rename = "all")]
+    All,
+    #[serde(rename = "5min")]
+    FiveMinutes,
+    #[default]
+    #[serde(rename = "10min")]
+    TenMinutes,
+    #[serde(rename = "15min")]
+    FifteenMinutes,
+    #[serde(rename = "30min")]
+    ThirtyMinutes,
+    #[serde(rename = "60min")]
+    SixtyMinutes,
+}
+
+impl RememberPlayback {
+    pub const OPTIONS: [Self; 6] = [
+        Self::All,
+        Self::FiveMinutes,
+        Self::TenMinutes,
+        Self::FifteenMinutes,
+        Self::ThirtyMinutes,
+        Self::SixtyMinutes,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::FiveMinutes => "5min",
+            Self::TenMinutes => "10min",
+            Self::FifteenMinutes => "15min",
+            Self::ThirtyMinutes => "30min",
+            Self::SixtyMinutes => "60min",
+        }
+    }
+
+    pub fn includes(self, duration: f64) -> bool {
+        let minutes = match self {
+            Self::All => 0,
+            Self::FiveMinutes => 5,
+            Self::TenMinutes => 10,
+            Self::FifteenMinutes => 15,
+            Self::ThirtyMinutes => 30,
+            Self::SixtyMinutes => 60,
+        };
+        duration.is_finite() && duration > f64::from(minutes * 60)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerConfig {
+    pub remember_playback: RememberPlayback,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -27,6 +84,7 @@ pub struct Config {
     pub game_folder_sort: String,
     pub volume: f64,
     pub muted: bool,
+    pub player: PlayerConfig,
 }
 
 impl Default for Config {
@@ -39,6 +97,7 @@ impl Default for Config {
             game_folder_sort: "newest_clip".into(),
             volume: 100.0,
             muted: false,
+            player: PlayerConfig::default(),
         }
     }
 }
@@ -148,6 +207,7 @@ pub struct MediaState {
     pub identity_version: u32,
     pub watched_at: String,
     pub track_gains: BTreeMap<i64, f64>,
+    pub resume_position: Option<f64>,
 }
 
 fn legacy_version() -> u32 {
@@ -162,6 +222,8 @@ struct WatchedRow {
     watched_at: String,
     #[serde(default)]
     track_gains: String,
+    #[serde(default)]
+    resume_position: Option<f64>,
 }
 
 pub type History = BTreeMap<String, MediaState>;
@@ -182,6 +244,14 @@ pub fn read_history(dir: &Path) -> Result<History, String> {
         .collect::<Vec<_>>();
     if headers != ["sha256", "watched_at"]
         && headers != ["sha256", "identity_version", "watched_at", "track_gains"]
+        && headers
+            != [
+                "sha256",
+                "identity_version",
+                "watched_at",
+                "track_gains",
+                "resume_position",
+            ]
     {
         return Err("Invalid watched.csv headers; file left unchanged".into());
     }
@@ -204,6 +274,7 @@ pub fn read_history(dir: &Path) -> Result<History, String> {
                 .map_err(|e| format!("Invalid track gains: {e}; watched.csv left unchanged"))?
         };
         validate_gains(&track_gains)?;
+        validate_resume_position(row.resume_position)?;
         if history
             .insert(
                 row.sha256.to_lowercase(),
@@ -211,6 +282,7 @@ pub fn read_history(dir: &Path) -> Result<History, String> {
                     identity_version: row.identity_version,
                     watched_at: row.watched_at,
                     track_gains,
+                    resume_position: row.resume_position,
                 },
             )
             .is_some()
@@ -226,10 +298,17 @@ pub fn save_history(dir: &Path, history: &History) -> Result<(), String> {
         .has_headers(false)
         .from_writer(Vec::new());
     writer
-        .write_record(["sha256", "identity_version", "watched_at", "track_gains"])
+        .write_record([
+            "sha256",
+            "identity_version",
+            "watched_at",
+            "track_gains",
+            "resume_position",
+        ])
         .map_err(|e| e.to_string())?;
     for (sha256, state) in history {
         validate_gains(&state.track_gains)?;
+        validate_resume_position(state.resume_position)?;
         writer
             .serialize(WatchedRow {
                 sha256: sha256.clone(),
@@ -237,6 +316,7 @@ pub fn save_history(dir: &Path, history: &History) -> Result<(), String> {
                 watched_at: state.watched_at.clone(),
                 track_gains: serde_json::to_string(&state.track_gains)
                     .map_err(|e| e.to_string())?,
+                resume_position: state.resume_position,
             })
             .map_err(|e| e.to_string())?;
     }
@@ -287,6 +367,13 @@ pub fn media_state(history: &History, path: &Path) -> MediaState {
             identity_version: 2,
             ..MediaState::default()
         })
+}
+
+pub fn validate_resume_position(position: Option<f64>) -> Result<(), String> {
+    if position.is_some_and(|p| !p.is_finite() || p <= 0.0) {
+        return Err("Invalid resume position; watched.csv left unchanged".into());
+    }
+    Ok(())
 }
 
 pub fn validate_gains(gains: &BTreeMap<i64, f64>) -> Result<(), String> {
@@ -368,6 +455,10 @@ mod tests {
         let config = read_config(dir.path()).unwrap();
         assert_eq!(config.volume, 100.0);
         assert!(!config.muted);
+        assert_eq!(
+            config.player.remember_playback,
+            RememberPlayback::TenMinutes
+        );
         for gain in [f64::NAN, f64::INFINITY, -0.1, 10.1] {
             assert!(validate_gains(&BTreeMap::from([(1, gain)])).is_err());
         }
@@ -378,6 +469,24 @@ mod tests {
         .unwrap();
         assert!(read_config(dir.path()).is_err());
     }
+    #[test]
+    fn remember_playback_options_roundtrip_and_reject_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        for option in RememberPlayback::OPTIONS {
+            let mut config = Config::default();
+            config.player.remember_playback = option;
+            save_config(dir.path(), &config).unwrap();
+            assert_eq!(
+                read_config(dir.path()).unwrap().player.remember_playback,
+                option
+            );
+        }
+        let bytes = br#"{"version":1,"player":{"remember_playback":"invalid"}}"#;
+        fs::write(dir.path().join("config.json"), bytes).unwrap();
+        assert!(read_config(dir.path()).is_err());
+        assert_eq!(fs::read(dir.path().join("config.json")).unwrap(), bytes);
+    }
+
     #[test]
     fn config_and_csv_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -397,6 +506,7 @@ mod tests {
                 identity_version: 2,
                 watched_at: "2026-10-14T18:42:00Z".into(),
                 track_gains: BTreeMap::from([(1, 0.4)]),
+                resume_position: Some(123.5),
             },
         )]);
         save_history(dir.path(), &history).unwrap();
@@ -412,6 +522,53 @@ mod tests {
         fs::write(dir.path().join("watched.csv"), b"wrong,headers\na,b\n").unwrap();
         assert!(read_history(dir.path()).is_err());
         assert_eq!(fs::read(dir.path().join("config.json")).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn audio_history_upgrades_without_losing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "b".repeat(64);
+        fs::write(
+            dir.path().join("watched.csv"),
+            format!("sha256,identity_version,watched_at,track_gains\n{hash},2,,{{}}\n"),
+        )
+        .unwrap();
+        let mut history = read_history(dir.path()).unwrap();
+        assert_eq!(history[&hash].resume_position, None);
+        history.get_mut(&hash).unwrap().resume_position = Some(63.25);
+        save_history(dir.path(), &history).unwrap();
+        assert_eq!(read_history(dir.path()).unwrap(), history);
+    }
+
+    #[test]
+    fn invalid_resume_positions_leave_history_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        save_history(dir.path(), &History::new()).unwrap();
+        let original = fs::read(dir.path().join("watched.csv")).unwrap();
+        for position in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            let history = History::from([(
+                "a".repeat(64),
+                MediaState {
+                    identity_version: 2,
+                    resume_position: Some(position),
+                    ..Default::default()
+                },
+            )]);
+            assert!(save_history(dir.path(), &history).is_err());
+            assert_eq!(fs::read(dir.path().join("watched.csv")).unwrap(), original);
+        }
+        for position in ["NaN", "inf", "-1", "0"] {
+            let bytes = format!(
+                "sha256,identity_version,watched_at,track_gains,resume_position\n{},2,,{{}},{position}\n",
+                "a".repeat(64)
+            );
+            fs::write(dir.path().join("watched.csv"), &bytes).unwrap();
+            assert!(read_history(dir.path()).is_err());
+            assert_eq!(
+                fs::read_to_string(dir.path().join("watched.csv")).unwrap(),
+                bytes
+            );
+        }
     }
     #[test]
     fn nvidia_settings_and_filename_identity() {

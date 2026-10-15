@@ -93,6 +93,7 @@ pub struct Snapshot {
     pub duration: f64,
     pub position: f64,
     pub paused: bool,
+    pub ended: bool,
     /// mpv volume percentage, 0..=100.
     pub volume: f64,
     pub muted: bool,
@@ -123,6 +124,7 @@ impl Default for Snapshot {
             duration: 0.0,
             position: 0.0,
             paused: true,
+            ended: false,
             volume: 100.0,
             muted: false,
             speed: 1.0,
@@ -596,6 +598,7 @@ struct Player {
     next_load: Option<LoadState>,
     saved_gains: std::collections::BTreeMap<i64, f64>,
     resume_position: Option<f64>,
+    pending_steps: std::collections::VecDeque<bool>,
 }
 
 impl Player {
@@ -652,6 +655,7 @@ impl Player {
             next_load: None,
             saved_gains: Default::default(),
             resume_position: None,
+            pending_steps: Default::default(),
         };
         for (name, value) in [
             ("vo", "libmpv"),
@@ -769,6 +773,9 @@ impl Player {
     }
 
     fn set_paused(&mut self, paused: bool) -> Result<(), String> {
+        if !paused {
+            self.pending_steps.clear();
+        }
         Print(
             Level::Debug,
             format!(
@@ -803,6 +810,25 @@ impl Player {
         self.waiting_for_seek = true;
         self.mailbox.invalidate_frames();
         let result = self.command(args);
+        if result.is_err() {
+            self.waiting_for_seek = false;
+        }
+        result
+    }
+
+    fn step_frame(&mut self, forward: bool) -> Result<(), String> {
+        self.set("mute", "yes")?;
+        self.set("pause", "yes")?;
+        self.frame_ready = false;
+        self.waiting_for_seek = true;
+        self.mailbox.invalidate_frames();
+        // Seek-based stepping never resumes the audio device, which may still
+        // contain samples queued before pause that mute cannot silence.
+        let result = if forward {
+            self.command(&["frame-step", "1", "seek"])
+        } else {
+            self.command(&["frame-back-step"])
+        };
         if result.is_err() {
             self.waiting_for_seek = false;
         }
@@ -851,6 +877,7 @@ impl Player {
         }
         self.state.duration = self.number("duration").unwrap_or(0.0).max(0.0);
         self.state.position = self.number("time-pos").unwrap_or(0.0).max(0.0);
+        self.state.ended = self.flag("eof-reached") == Some(true);
         // A native frame-step temporarily unpauses. Only explicit play commands
         // can clear the user's pause intent. Native EOF pauses also latch it.
         self.intended_paused |= self.flag("pause") == Some(true);
@@ -980,6 +1007,7 @@ impl Player {
                 self.execute(Command::Load(path))
             }
             Command::Load(path) => {
+                self.pending_steps.clear();
                 let saved = self.next_load.take();
                 let requested_path = path.clone();
                 let path = std::fs::canonicalize(&path)
@@ -1030,6 +1058,7 @@ impl Player {
             Command::Play => self.set_paused(false),
             Command::Pause => self.set_paused(true),
             Command::Stop => {
+                self.pending_steps.clear();
                 self.set_paused(true)?;
                 self.frame_ready = false;
                 self.mailbox.invalidate_frames();
@@ -1041,10 +1070,12 @@ impl Player {
                 Ok(())
             }
             Command::SeekAbsolute(value) => {
+                self.pending_steps.clear();
                 finite_range(value, 0.0, f64::MAX, "Seek position")?;
                 self.seek_command(&["seek", &value.to_string(), "absolute+exact"])
             }
             Command::SeekRelative(value) => {
+                self.pending_steps.clear();
                 if !value.is_finite() {
                     return Err("Seek offset must be finite".into());
                 }
@@ -1054,12 +1085,17 @@ impl Player {
                 if !self.intended_paused {
                     return Err("Frame stepping is only allowed while paused".into());
                 }
-                self.set("mute", "yes")?;
-                if matches!(command, Command::FrameStep) {
-                    self.command(&["frame-step", "1", "mute"])
+                let forward = matches!(command, Command::FrameStep);
+                // Relative frame seeks issued before the previous seek finishes
+                // can collapse onto the same frame. Keep their original order.
+                if self.waiting_for_seek || !self.frame_ready {
+                    if self.pending_steps.len() >= 128 {
+                        return Err("Frame step queue is full".into());
+                    }
+                    self.pending_steps.push_back(forward);
+                    Ok(())
                 } else {
-                    self.set("pause", "yes")?;
-                    self.seek_command(&["frame-back-step"])
+                    self.step_frame(forward)
                 }
             }
             Command::SetVolume(value) => {
@@ -1309,6 +1345,14 @@ impl Player {
                 _ => {}
             }
         }
+        if self.intended_paused
+            && self.frame_ready
+            && !self.waiting_for_seek
+            && let Some(forward) = self.pending_steps.pop_front()
+            && let Err(error) = self.step_frame(forward)
+        {
+            self.state.error = Some(error);
+        }
         true
     }
 }
@@ -1365,6 +1409,13 @@ fn preview_size(width: u32, height: u32) -> (u32, u32) {
 }
 
 impl PreviewDecoder {
+    pub(crate) fn duration(&self) -> Option<f64> {
+        self.path.as_ref()?;
+        self.player
+            .number("duration")
+            .filter(|seconds| *seconds > 0.0)
+    }
+
     pub(crate) fn new() -> Result<Self, String> {
         let player = Player::new_configured(
             Arc::new(Mailbox::new()),
@@ -2095,6 +2146,7 @@ mod tests {
                 .all(|t| t["selected"] != true)
         );
         assert!(decoder.player.state.tracks.is_empty());
+        assert_eq!(decoder.duration(), Some(6.0));
         assert!(
             decoder
                 .decode(&path, 2.0, Instant::now() + Duration::from_secs(5), || true)
@@ -2221,6 +2273,7 @@ mod tests {
                 assert!(player.state.paused);
                 smoke_wait(&mut player, "silent step", |p| {
                     assert!(p.state.paused, "Native step cleared logical pause");
+                    assert_eq!(p.flag("pause"), Some(true), "Step resumed the audio device");
                     assert_eq!(p.state.muted, user_muted);
                     assert_eq!(p.flag("mute"), Some(true), "Step released effective mute");
                     assert_eq!(p.state.volume, 37.0);
@@ -2240,8 +2293,17 @@ mod tests {
             assert_eq!(player.flag("mute"), Some(true));
             smoke_wait(&mut player, "repeated silent steps", |p| {
                 assert!(p.state.paused);
+                assert_eq!(p.flag("pause"), Some(true));
                 assert_eq!(p.flag("mute"), Some(true));
                 p.flag("pause") == Some(true) && p.state.position >= 1.19
+            });
+            player.execute(Command::FrameStep).unwrap();
+            player.execute(Command::FrameBackStep).unwrap();
+            player.execute(Command::FrameStep).unwrap();
+            smoke_wait(&mut player, "ordered mixed steps", |p| {
+                assert_eq!(p.flag("pause"), Some(true));
+                assert_eq!(p.flag("mute"), Some(true));
+                p.frame_ready && p.pending_steps.is_empty() && (p.state.position - 1.3).abs() < 0.01
             });
             player.execute(Command::Toggle).unwrap();
             assert!(!player.intended_paused);

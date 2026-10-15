@@ -13,6 +13,7 @@ use gpui_kit::component::{
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
+    Player,
     Library,
     Theme,
     Keys,
@@ -21,6 +22,7 @@ enum Page {
 impl Page {
     fn title(self) -> &'static str {
         match self {
+            Self::Player => "Player",
             Self::Library => "Clip Library",
             Self::Theme => "Theme",
             Self::Keys => "Keybinds",
@@ -34,6 +36,7 @@ pub(super) struct SettingsState {
     search: Entity<InputState>,
     key_filter: Entity<InputState>,
     themes: Entity<SelectState<Vec<ThemeChoice>>>,
+    remember_playback: Entity<SelectState<Vec<RememberChoice>>>,
     theme_revision: u64,
     theme_table: Entity<TableState<ThemeTable>>,
     table: Entity<TableState<KeyTable>>,
@@ -52,6 +55,19 @@ struct ThemeLayout {
     active_row: Rc<std::cell::Cell<Bounds<Pixels>>>,
     selector: Rc<std::cell::Cell<Bounds<Pixels>>>,
     table: Rc<std::cell::Cell<Bounds<Pixels>>>,
+}
+
+#[derive(Clone)]
+struct RememberChoice(crate::clip_store::RememberPlayback);
+
+impl SelectItem for RememberChoice {
+    type Value = crate::clip_store::RememberPlayback;
+    fn title(&self) -> SharedString {
+        self.0.label().into()
+    }
+    fn value(&self) -> &Self::Value {
+        &self.0
+    }
 }
 
 #[derive(Clone)]
@@ -402,6 +418,19 @@ impl ClipBrowser {
             InputState::new(window, cx).placeholder("Filter actions, keystrokes or contexts…")
         });
         let themes = cx.new(|cx| SelectState::new(Vec::<ThemeChoice>::new(), None, window, cx));
+        let remember_playback = cx.new(|cx| {
+            let mut state = SelectState::new(
+                crate::clip_store::RememberPlayback::OPTIONS
+                    .into_iter()
+                    .map(RememberChoice)
+                    .collect::<Vec<_>>(),
+                None,
+                window,
+                cx,
+            );
+            state.set_selected_value(&self.config.player.remember_playback, window, cx);
+            state
+        });
         let table = cx.new(|cx| {
             TableState::new(
                 KeyTable {
@@ -427,6 +456,13 @@ impl ClipBrowser {
             .row_selectable(false)
         });
         let subscriptions = vec![
+            cx.subscribe_in(&remember_playback, window, |this, _, event, _, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    this.config.player.remember_playback = *value;
+                    this.worker.send(Request::RememberPlayback(*value));
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&key_filter, |this, _, _: &InputEvent, cx| {
                 this.settings_state.as_mut().unwrap().selected = None;
@@ -466,6 +502,7 @@ impl ClipBrowser {
             search,
             key_filter,
             themes,
+            remember_playback,
             theme_revision: u64::MAX,
             theme_table,
             table,
@@ -514,19 +551,25 @@ impl ClipBrowser {
             .header(SidebarHeader::new().child(settings_input(&state.search, window, cx)))
             .child(
                 SidebarMenu::new().children(
-                    [Page::Library, Page::Theme, Page::Keys, Page::About]
-                        .into_iter()
-                        .map(|p| {
-                            SidebarMenuItem::new(p.title())
-                                .active(page == p)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let state = this.settings_state.as_mut().unwrap();
-                                    state.page = p;
-                                    state.selected = None;
-                                    this.focus.focus(window, cx);
-                                    cx.notify();
-                                }))
-                        }),
+                    [
+                        Page::Player,
+                        Page::Library,
+                        Page::Theme,
+                        Page::Keys,
+                        Page::About,
+                    ]
+                    .into_iter()
+                    .map(|p| {
+                        SidebarMenuItem::new(p.title())
+                            .active(page == p)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let state = this.settings_state.as_mut().unwrap();
+                                state.page = p;
+                                state.selected = None;
+                                this.focus.focus(window, cx);
+                                cx.notify();
+                            }))
+                    }),
                 ),
             )
             .footer(
@@ -539,6 +582,7 @@ impl ClipBrowser {
                 ),
             );
         let content = match page {
+            Page::Player => self.render_player_settings(&query, window, cx),
             Page::Library => self.render_library_filtered(&query, cx),
             Page::Theme => self.render_theme(window, cx),
             Page::Keys => self.render_keymap(window, cx),
@@ -599,6 +643,36 @@ impl ClipBrowser {
                     )
                     .child(content),
             )
+            .into_any_element()
+    }
+
+    fn render_player_settings(
+        &self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selector = &self.settings_state.as_ref().unwrap().remember_playback;
+        if selector.read(cx).selected_value() != Some(&self.config.player.remember_playback) {
+            selector.update(cx, |state, cx| {
+                state.set_selected_value(&self.config.player.remember_playback, window, cx);
+            });
+        }
+        let matches =
+            "player.remember_playback remember playback resume minimum clip length duration"
+                .contains(query);
+        div().flex().flex_col().gap_3()
+            .when(matches, |body| body.child(
+                div().id("player.remember_playback").flex().items_center().justify_between().gap_4()
+                    .child(div().flex_1().flex().flex_col().gap_1()
+                        .child("Remember playback")
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                            .child("Offer to resume clips longer than this duration. All remembers every clip."))
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                            .child("player.remember_playback")))
+                    .child(div().w(px(160.)).flex_shrink_0().child(Select::new(selector)))
+            ))
+            .when(!matches, |body| body.child("No matching player settings."))
             .into_any_element()
     }
 
@@ -1602,7 +1676,7 @@ mod tests {
                 cx.activate(true);
                 cx.spawn(async move |cx| {
                     let outcome: Result<(), String> = async {
-                        for page in [Page::Library, Page::Theme, Page::About, Page::Keys] {
+                        for page in [Page::Player, Page::Library, Page::Theme, Page::About, Page::Keys] {
                             cx.background_executor()
                                 .timer(std::time::Duration::from_millis(250))
                                 .await;

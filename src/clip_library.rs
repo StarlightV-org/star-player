@@ -139,11 +139,13 @@ pub enum Request {
     RemoveFolder(PathBuf),
     Detect,
     Sort(String),
+    RememberPlayback(clip_store::RememberPlayback),
     Refresh,
     Thumbnail(PathBuf, Stamp),
     Watched(Vec<PathBuf>, bool, String),
     Delete(Vec<PathBuf>, Arc<AtomicBool>),
     Audio(PathBuf, BTreeMap<i64, f64>),
+    Resume(PathBuf, Option<f64>),
     Master(f64, bool),
     Rename(PathBuf, String, Arc<AtomicBool>),
     Shutdown,
@@ -153,7 +155,7 @@ pub enum Event {
     SteamConsent(Result<bool, String>),
     Catalog(Catalog),
     History(History),
-    Thumbnail(PathBuf, Stamp, Option<image::RgbaImage>),
+    Thumbnail(PathBuf, Stamp, Option<image::RgbaImage>, Option<f64>),
     WatchedComplete(Vec<PathBuf>),
     Error(String),
     Renamed(PathBuf, PathBuf),
@@ -285,6 +287,31 @@ fn run(
                 Request::Shutdown => {
                     closing = true;
                     tasks.clear();
+                }
+                Request::Resume(path, position) => {
+                    let result = (|| {
+                        if !history_valid {
+                            return Err(
+                                "Repair watched.csv before saving playback positions".into()
+                            );
+                        }
+                        clip_store::validate_resume_position(position)?;
+                        let mut next = history.clone();
+                        let mut state = clip_store::media_state(&next, &path);
+                        state.resume_position = position;
+                        next.insert(clip_store::hash_filename(&path)?, state);
+                        clip_store::save_history(dir, &next)?;
+                        history = next;
+                        Ok::<_, String>(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            let _ = events.send(Event::History(history.clone()));
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Error(e));
+                        }
+                    }
                 }
                 Request::Audio(path, gains) => {
                     let result = (|| {
@@ -460,6 +487,24 @@ fn run(
                             config = next;
                             let _ = events.send(Event::Config(config.clone()));
                             dirty = Some(Instant::now() - Duration::from_secs(1));
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Error(e));
+                        }
+                    }
+                }
+                Request::RememberPlayback(value) => {
+                    let mut next = config.clone();
+                    next.player.remember_playback = value;
+                    let result = if config_valid {
+                        clip_store::save_config(dir, &next)
+                    } else {
+                        Err("Repair config.json before saving preferences".into())
+                    };
+                    match result {
+                        Ok(()) => {
+                            config = next;
+                            let _ = events.send(Event::Config(config.clone()));
                         }
                         Err(e) => {
                             let _ = events.send(Event::Error(e));
@@ -660,7 +705,7 @@ fn run(
                 }
                 Request::Thumbnail(path, expected) => {
                     if stamp(&path).ok().as_ref() != Some(&expected) {
-                        let _ = events.send(Event::Thumbnail(path, expected, None));
+                        let _ = events.send(Event::Thumbnail(path, expected, None, None));
                         continue;
                     }
                     let key = format!(
@@ -668,35 +713,59 @@ fn run(
                         Sha256::digest(format!("{}:{expected:?}", path.display()).as_bytes())
                     );
                     let cache = dir.join("thumbnails").join(format!("{key}.jpg"));
-                    let cached = image::open(&cache).ok().map(|i| i.into_rgba8());
-                    let image = cached.or_else(|| {
+                    let duration_cache = cache.with_extension("duration");
+                    let mut duration = fs::read(&duration_cache)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<f64>(&bytes).ok())
+                        .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+                    let mut image = image::open(&cache).ok().map(|i| i.into_rgba8());
+                    if image.is_none() || duration.is_none() {
                         if decoder.is_none() {
                             decoder = PreviewDecoder::new().ok();
                         }
-                        let result = decoder.as_mut()?.decode(
-                            &path,
-                            1.0,
-                            Instant::now() + Duration::from_secs(5),
-                            || stop.load(Ordering::Acquire),
-                        );
+                        let result = decoder
+                            .as_mut()
+                            .ok_or_else(|| "Preview decoder unavailable".to_owned())
+                            .and_then(|decoder| {
+                                decoder.decode(
+                                    &path,
+                                    1.0,
+                                    Instant::now() + Duration::from_secs(5),
+                                    || stop.load(Ordering::Acquire),
+                                )
+                            });
                         match result {
-                            Ok(image) => {
+                            Ok(decoded) => {
                                 if stamp(&path).ok().as_ref() != Some(&expected) {
-                                    return None;
-                                }
-                                if let Err(e) = crate::thumbnail_cache::save(&cache, &image) {
                                     let _ =
-                                        events.send(Event::Error(format!("Thumbnail cache: {e}")));
+                                        events.send(Event::Thumbnail(path, expected, None, None));
+                                    continue;
                                 }
-                                Some(image)
+                                duration = decoder.as_ref().and_then(PreviewDecoder::duration);
+                                if image.is_none() {
+                                    if let Err(e) = crate::thumbnail_cache::save(&cache, &decoded) {
+                                        let _ = events
+                                            .send(Event::Error(format!("Thumbnail cache: {e}")));
+                                    }
+                                    image = Some(decoded);
+                                }
+                                if let Some(seconds) = duration
+                                    && cache.is_file()
+                                    && let Err(e) = clip_store::atomic_write(
+                                        &duration_cache,
+                                        seconds.to_string().as_bytes(),
+                                    )
+                                {
+                                    let _ = events
+                                        .send(Event::Error(format!("Clip duration cache: {e}")));
+                                }
                             }
                             Err(_) => {
                                 decoder = None;
-                                None
                             }
                         }
-                    });
-                    let _ = events.send(Event::Thumbnail(path, expected, image));
+                    }
+                    let _ = events.send(Event::Thumbnail(path, expected, image, duration));
                 }
                 _ => {}
             }
@@ -947,6 +1016,7 @@ mod tests {
             identity_version: 2,
             watched_at: "2026-10-14T18:42:00Z".into(),
             track_gains: BTreeMap::from([(1, 0.25), (2, 0.0)]),
+            resume_position: Some(345.75),
         };
         let old_hash = clip_store::hash_filename(&old).unwrap();
         let mut history = History::from([(old_hash.clone(), state.clone())]);
@@ -1030,6 +1100,9 @@ mod tests {
         tx.send(Request::Audio(path.clone(), BTreeMap::from([(1, 0.4)])))
             .unwrap();
         tx.send(Request::Master(32.0, true)).unwrap();
+        tx.send(Request::RememberPlayback(clip_store::RememberPlayback::All))
+            .unwrap();
+        tx.send(Request::Resume(path.clone(), Some(87.5))).unwrap();
         tx.send(Request::Watched(
             vec![path.clone()],
             true,
@@ -1052,10 +1125,15 @@ mod tests {
         .unwrap();
         let config = clip_store::read_config(dir.path()).unwrap();
         assert_eq!(config.volume, 32.0);
+        assert_eq!(
+            config.player.remember_playback,
+            clip_store::RememberPlayback::All
+        );
         assert!(config.muted);
         let state = clip_store::media_state(&clip_store::read_history(dir.path()).unwrap(), &path);
         assert!(state.watched_at.is_empty());
         assert_eq!(state.track_gains.get(&1), Some(&0.4));
+        assert_eq!(state.resume_position, Some(87.5));
     }
     #[test]
     fn preserves_nested_folders_and_deduplicates_roots() {

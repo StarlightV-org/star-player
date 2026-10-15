@@ -75,6 +75,7 @@ pub struct ClipBrowser {
     catalog: Catalog,
     history: History,
     thumbnails: HashMap<PathBuf, (Stamp, Option<Arc<RenderImage>>)>,
+    durations: HashMap<PathBuf, (Stamp, Option<f64>)>,
     requested: HashSet<(PathBuf, Stamp)>,
     pending_watched: HashMap<PathBuf, bool>,
     folder: Option<PathBuf>,
@@ -89,6 +90,7 @@ pub struct ClipBrowser {
     config_ready: bool,
     history_ready: bool,
     audio_overrides: HashMap<String, std::collections::BTreeMap<i64, f64>>,
+    resume_overrides: HashMap<String, Option<f64>>,
     pub settings: bool,
     rename_subscription: Option<Subscription>,
     settings_state: Option<settings::SettingsState>,
@@ -149,6 +151,7 @@ impl ClipBrowser {
             catalog: Catalog::default(),
             history: History::new(),
             thumbnails: HashMap::new(),
+            durations: HashMap::new(),
             requested: HashSet::new(),
             pending_watched: HashMap::new(),
             folder: None,
@@ -163,6 +166,7 @@ impl ClipBrowser {
             config_ready: false,
             history_ready: false,
             audio_overrides: HashMap::new(),
+            resume_overrides: HashMap::new(),
             settings: false,
             rename_subscription: None,
             settings_state: None,
@@ -237,6 +241,12 @@ impl ClipBrowser {
                 },
                 Event::Catalog(catalog) => {
                     self.catalog = catalog;
+                    self.durations.retain(|p, (s, _)| {
+                        self.catalog
+                            .clips
+                            .iter()
+                            .any(|c| c.path == *p && c.stamp == *s)
+                    });
                     self.thumbnails.retain(|p, (s, _)| {
                         self.catalog
                             .clips
@@ -255,6 +265,11 @@ impl ClipBrowser {
                     self.rebuild();
                 }
                 Event::History(history) => {
+                    self.resume_overrides.retain(|key, position| {
+                        !history
+                            .get(key)
+                            .is_some_and(|state| state.resume_position == *position)
+                    });
                     self.audio_overrides.retain(|key, gains| {
                         !history
                             .get(key)
@@ -269,13 +284,17 @@ impl ClipBrowser {
                     self.selected = view.selected;
                     self.anchor = view.anchor;
                     self.thumbnails.remove(&old);
+                    self.durations.remove(&old);
                     self.requested.retain(|(path, _)| path != &old);
                     if let (Ok(old_hash), Ok(new_hash)) = (
                         crate::clip_store::hash_filename(&old),
                         crate::clip_store::hash_filename(&new),
                     ) {
                         if let Some(gains) = self.audio_overrides.remove(&old_hash) {
-                            self.audio_overrides.insert(new_hash, gains);
+                            self.audio_overrides.insert(new_hash.clone(), gains);
+                        }
+                        if let Some(position) = self.resume_overrides.remove(&old_hash) {
+                            self.resume_overrides.insert(new_hash, position);
                         }
                     }
                     for clip in &mut self.catalog.clips {
@@ -297,7 +316,7 @@ impl ClipBrowser {
                         self.pending_watched.remove(&path);
                     }
                 }
-                Event::Thumbnail(path, stamp, image) => {
+                Event::Thumbnail(path, stamp, image, duration) => {
                     if self
                         .catalog
                         .clips
@@ -311,8 +330,11 @@ impl ClipBrowser {
                             self.thumbnails.remove(&key);
                             self.requested.retain(|(p, _)| p != &key);
                         }
-                        self.thumbnails
-                            .insert(path, (stamp, image.map(crate::render_image)));
+                        self.thumbnails.insert(
+                            path.clone(),
+                            (stamp.clone(), image.map(crate::render_image)),
+                        );
+                        self.durations.insert(path, (stamp, duration));
                     }
                 }
                 Event::Error(error) => {
@@ -479,6 +501,12 @@ impl ClipBrowser {
     }
     pub fn media_state(&self, path: &Path) -> crate::clip_store::MediaState {
         let mut state = crate::clip_store::media_state(&self.history, path);
+        if let Some(position) = crate::clip_store::hash_filename(path)
+            .ok()
+            .and_then(|key| self.resume_overrides.get(&key))
+        {
+            state.resume_position = *position;
+        }
         if let Some(gains) = crate::clip_store::hash_filename(path)
             .ok()
             .and_then(|key| self.audio_overrides.get(&key))
@@ -498,6 +526,16 @@ impl ClipBrowser {
         }
         self.worker.send(Request::Audio(path, gains));
     }
+    pub fn save_resume(&mut self, path: PathBuf, position: Option<f64>) {
+        if let Ok(hash) = crate::clip_store::hash_filename(&path) {
+            let mut state = self.media_state(&path);
+            state.resume_position = position;
+            self.history.insert(hash.clone(), state);
+            self.resume_overrides.insert(hash, position);
+        }
+        self.worker.send(Request::Resume(path, position));
+    }
+
     pub fn save_master(&mut self, volume: f64, muted: bool) {
         self.config.volume = volume;
         self.config.muted = muted;
@@ -917,6 +955,17 @@ impl ClipBrowser {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(date(clip.created)),
                             ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(crate::clip_details::duration(
+                                self.durations
+                                    .get(&path)
+                                    .filter(|(stamp, _)| stamp == &clip.stamp)
+                                    .and_then(|(_, duration)| *duration),
+                            )),
                     )
                     .when(!watched, |s| {
                         s.child(
@@ -1720,7 +1769,5 @@ mod tests {
     }
 }
 fn date(time: SystemTime) -> String {
-    chrono::DateTime::<chrono::Local>::from(time)
-        .format("%Y-%m-%d %H:%M")
-        .to_string()
+    crate::clip_details::date(time, SystemTime::now())
 }

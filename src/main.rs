@@ -24,6 +24,7 @@ use std::{
 
 mod app_assets;
 mod app_icon;
+mod clip_details;
 mod clip_library;
 mod clip_store;
 mod components;
@@ -38,6 +39,7 @@ mod navigation;
 mod notifications;
 mod playback;
 mod preview;
+mod resume;
 mod runtime;
 mod steam_games;
 mod theme;
@@ -122,6 +124,11 @@ struct PlayerShell {
     pending_master: Option<(f64, bool)>,
     pending_audio: Option<(PathBuf, std::collections::BTreeMap<i64, f64>)>,
     audio_changed: Instant,
+    resume_candidate: Option<f64>,
+    resume_prompt: Option<resume::Prompt>,
+    resume_focus: FocusHandle,
+    resume_saved_at: Instant,
+    resume_stopped: bool,
     rename_resume: Option<(PathBuf, f64, bool)>,
     rename_busy: bool,
     hover_navigation: Option<bool>,
@@ -361,6 +368,7 @@ impl PlayerShell {
                         this.rename_busy = true;
                         this.navigation_scan.take();
                         this.flush_audio(cx);
+                        this.save_resume(cx);
                         if this.path.as_ref() == Some(path) {
                             this.rename_resume =
                                 Some((path.clone(), this.snapshot.position, this.snapshot.paused));
@@ -505,6 +513,7 @@ impl PlayerShell {
         window.on_window_should_close(cx, move |_, cx| {
             let _ = shell_entity.update(cx, |shell, cx| {
                 shell.flush_audio(cx);
+                shell.save_resume(cx);
                 shell.shutdown();
             });
             true
@@ -525,6 +534,11 @@ impl PlayerShell {
             pending_master: None,
             pending_audio: None,
             audio_changed: Instant::now(),
+            resume_candidate: None,
+            resume_prompt: None,
+            resume_focus: cx.focus_handle(),
+            resume_saved_at: Instant::now(),
+            resume_stopped: false,
             rename_resume: None,
             rename_busy: false,
             hover_navigation: None,
@@ -562,6 +576,23 @@ impl PlayerShell {
             return;
         }
         match &command {
+            Command::Pause | Command::Toggle if !self.snapshot.paused => self.save_resume(cx),
+            Command::Play | Command::Toggle => self.resume_stopped = false,
+            Command::Stop => {
+                self.resume_stopped = true;
+                self.resume_prompt = None;
+                self.resume_candidate = None;
+                if let Some(path) = self.path.clone() {
+                    self.browser
+                        .update(cx, |browser, _| browser.save_resume(path, None));
+                }
+            }
+            Command::SeekAbsolute(_)
+            | Command::SeekRelative(_)
+            | Command::FrameStep
+            | Command::FrameBackStep => {
+                self.resume_stopped = false;
+            }
             Command::SetVolume(volume) => {
                 self.master_volume = *volume;
                 self.pending_master = Some((*volume, self.master_muted));
@@ -608,6 +639,42 @@ impl PlayerShell {
         if let Some((path, gains)) = self.pending_audio.take() {
             self.browser
                 .update(cx, |browser, _| browser.save_audio(path, gains));
+        }
+    }
+
+    fn save_resume(&mut self, cx: &mut Context<Self>) {
+        self.resume_saved_at = Instant::now();
+        // Read the worker before teardown rather than persisting an older UI poll.
+        let Some(player) = &self.playback else {
+            return;
+        };
+        let snapshot = player.snapshot();
+        if snapshot.path != self.path
+            || !self
+                .browser
+                .read(cx)
+                .config()
+                .player
+                .remember_playback
+                .includes(snapshot.duration)
+            || snapshot.error.is_some()
+        {
+            return;
+        }
+        let position = if self.resume_stopped || snapshot.ended {
+            None
+        } else {
+            resume::position(
+                self.browser.read(cx).config().player.remember_playback,
+                snapshot.duration,
+                snapshot.position,
+            )
+        };
+        if let Some(path) = self.path.clone()
+            && self.browser.read(cx).media_state(&path).resume_position != position
+        {
+            self.browser
+                .update(cx, |browser, _| browser.save_resume(path, position));
         }
     }
 
@@ -668,7 +735,8 @@ impl PlayerShell {
     }
 
     fn load_media(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.load_media_at(path, 0.0, false, cx);
+        self.load_media_at(path.clone(), 0.0, false, cx);
+        self.resume_candidate = self.browser.read(cx).media_state(&path).resume_position;
     }
 
     fn load_media_at(
@@ -678,6 +746,11 @@ impl PlayerShell {
         paused: bool,
         cx: &mut Context<Self>,
     ) {
+        self.save_resume(cx);
+        self.resume_prompt = None;
+        self.resume_candidate = None;
+        self.resume_stopped = false;
+        self.resume_saved_at = Instant::now();
         self.flush_audio(cx);
         if !self.browser.read(cx).audio_ready() {
             self.path = Some(path.clone());
@@ -825,7 +898,42 @@ impl PlayerShell {
             self.flush_audio(cx);
         }
         if let Some(player) = &self.playback {
-            self.snapshot = player.snapshot();
+            let snapshot = player.snapshot();
+            let paused_now = snapshot.paused && !self.snapshot.paused;
+            let ended_now = snapshot.ended && !self.snapshot.ended;
+            self.snapshot = snapshot;
+            if self.snapshot.path == self.path
+                && self.snapshot.duration > 0.0
+                && let Some(position) = self.resume_candidate.take()
+                && let Some(position) = resume::position(
+                    self.browser.read(cx).config().player.remember_playback,
+                    self.snapshot.duration,
+                    position,
+                )
+            {
+                self.resume_prompt = Some(resume::Prompt::new(position, Instant::now()));
+            }
+            if paused_now || ended_now || self.resume_saved_at.elapsed() >= Duration::from_secs(5) {
+                self.save_resume(cx);
+            }
+        }
+        if !self
+            .browser
+            .read(cx)
+            .config()
+            .player
+            .remember_playback
+            .includes(self.snapshot.duration)
+        {
+            self.resume_prompt = None;
+        }
+        if let Some(prompt) = &mut self.resume_prompt
+            && prompt.expired(
+                Instant::now(),
+                self.resume_focus.contains_focused(window, cx),
+            )
+        {
+            self.resume_prompt = None;
         }
         if let Some(error) = self.error.take() {
             notifications::error(window, cx, "Player", &error);
@@ -904,6 +1012,7 @@ impl PlayerShell {
                 || self.title_focus.is_focused(window)
                 || self.rename_busy
                 || self.snapshot.paused
+                || self.resume_prompt.is_some()
                 || self.hover_navigation.is_some()
                 || self.snapshot.error.is_some(),
             self.controls_dragging,
@@ -1093,6 +1202,9 @@ impl PlayerShell {
     }
 
     fn show_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_resume(cx);
+        self.resume_prompt = None;
+        self.resume_candidate = None;
         self.flush_audio(cx);
         self.pending_load = None;
         if window.is_fullscreen() {
@@ -1282,6 +1394,48 @@ impl Render for PlayerShell {
                         .occlude()
                         .bg(cx.theme().background.opacity(1.0))
                         .child(self.browser.clone()),
+                )
+            })
+            .when(self.resume_prompt.is_some() && self.path.is_some() && !self.show_settings, |shell| {
+                let position = self.resume_prompt.as_ref().unwrap().position;
+                let seconds = position.floor() as u64;
+                let timestamp = if seconds >= 3600 {
+                    format!("{}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
+                } else {
+                    format!("{}:{:02}", seconds / 60, seconds % 60)
+                };
+                shell.child(
+                    div().absolute().left_4().right_4()
+                        .bottom(px(if self.controls_visible { 140.0 } else { 24.0 }))
+                        .flex().justify_center()
+                        .child(
+                            div().id("resume-toast").track_focus(&self.resume_focus)
+                                .occlude().flex().items_center().gap_3().px_3().py_2()
+                                .rounded_lg().bg(cx.theme().background.opacity(0.96))
+                                .border_1().border_color(cx.theme().border).shadow_lg()
+                                .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
+                                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                                    if let Some(prompt) = &mut this.resume_prompt {
+                                        prompt.expired(Instant::now(), this.resume_focus.contains_focused(window, cx));
+                                        prompt.hovered = *hovered;
+                                    }
+                                    this.reveal_controls(cx);
+                                }))
+                                .child(format!("Resume from {timestamp}?"))
+                                .child(Button::new("resume-playback").label("Resume")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.resume_prompt = None;
+                                        this.command(Command::SeekAbsolute(position), cx);
+                                        window.focus(&this.focus, cx);
+                                    })))
+                                .child(Button::new("dismiss-resume").ghost().label("×")
+                                    .tooltip("Dismiss resume prompt")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.resume_prompt = None;
+                                        window.focus(&this.focus, cx);
+                                        cx.notify();
+                                    }))),
+                        ),
                 )
             })
             .when(

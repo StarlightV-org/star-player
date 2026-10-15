@@ -37,7 +37,15 @@ pub fn prune(directory: &Path) -> Result<(), String> {
             break;
         }
         match fs::remove_file(&path) {
-            Ok(()) => total = total.saturating_sub(size),
+            Ok(()) => {
+                total = total.saturating_sub(size);
+                let duration = path.with_extension("duration");
+                if let Err(e) = fs::remove_file(&duration)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    errors.push(format!("{}: {e}", duration.display()));
+                }
+            }
             Err(e) => errors.push(format!("{}: {e}", path.display())),
         }
     }
@@ -68,11 +76,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let old = dir.path().join(format!("{}.jpg", "a".repeat(64)));
         fs::write(&old, vec![0; 1_200_000]).unwrap();
+        fs::write(old.with_extension("duration"), b"123.5").unwrap();
         let new = dir.path().join(format!("{}.jpg", "b".repeat(64)));
         fs::write(&new, vec![0; 1_200_000]).unwrap();
         fs::write(dir.path().join("keep.txt"), b"keep").unwrap();
         prune(dir.path()).unwrap();
         assert!(!old.exists());
+        assert!(!old.with_extension("duration").exists());
         assert!(new.exists());
         assert!(dir.path().join("keep.txt").exists());
     }
