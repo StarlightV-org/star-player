@@ -173,7 +173,7 @@ player error boxes. Repeated playback failures do not notify on every poll.
 The audio mixer and file-information panels close when clicking outside them.
 Their toggle buttons still open and close them, and clicks inside the panels
 do not dismiss them. An open mixer keeps the player controls visible.
-Keyboard shortcuts are listed in Settings
+Keyboard shortcuts are listed in Settings > Keybinds
 and remain accessible with H or ?.
 
 Pinned build:
@@ -197,6 +197,11 @@ playback. External audio-file attachment is not implemented.
 
 ## Controls
 
+Settings opens inside the main window, with Clip Library, Theme, Keybinds and
+About pages in the sidebar. The default shortcuts below can be changed in
+Settings > Keybinds, including the foreground media keys. Windows system volume
+keys are not intercepted.
+
 Click the video to play or pause. Double-click it to maximize or restore the
 window. A double-click does not also toggle playback; single clicks wait for the
 Windows double-click interval. The fullscreen button and F still toggle actual
@@ -210,6 +215,7 @@ history. These buttons do not seek or step through the folder's video list.
 | Action                           | Shortcut                      |
 | -------------------------------- | ----------------------------- |
 | Open media                       | Ctrl+O                        |
+| Open settings                    | Ctrl+,                        |
 | Play/pause                       | Space or K                    |
 | Play                             | P                             |
 | Pause                            | Pause key                     |
@@ -244,10 +250,23 @@ gains remain unchanged.
 ## Themes
 
 Spacer keeps the original dark plum and rose palette by default. On launch it
-creates `~/.spacer/theme.json` if that file does not exist. It never overwrites
-an existing theme. Edit this file to customize the colors, then press
-Ctrl+Shift+T to reload it or restart Spacer. Keep copies of alternative themes
-and copy the one you want to `theme.json`.
+creates `~/.spacer/themes/spacer-original.json` if missing, without overwriting
+existing edits. The default file uses hex colors. The old `~/.spacer/theme.json`
+is left untouched and is no longer loaded.
+
+Choose a theme in Settings > Theme to apply it immediately. The selector shows
+each file's `name` field. Spacer remembers the selection in `appearance.json`.
+The themes folder is watched for additions, deletions, renames and content edits,
+including editors that replace a file on save. Changes to the active theme apply
+automatically. If it disappears, Spacer switches to Spacer original.
+
+Create new theme copies the active theme to `custom.json`, then `custom-2.json`,
+and so on, and selects the copy. The theme table has per-file Use, Rename and
+Show file actions. Renaming an inactive theme does not change the active theme.
+Rename updates both `name` and the filename.
+For example, `Midnight Rose` becomes `midnight-rose.json`. Duplicate names and
+filenames are blocked without regard to letter case. Open themes folder lets you
+edit the color values in your preferred editor.
 
 Colors accept `#RRGGBB`, `#RRGGBBAA`, or OKLCH arrays with lightness, chroma,
 hue and optional alpha. The default file lists all supported color names.
@@ -266,8 +285,39 @@ Partial themes inherit unspecified colors from the original palette:
 ```
 
 Controls, floating panels, borders and thumbnails use these theme colors.
-Invalid themes fall back to the original palette without changing the file;
-the `Print` log reports the problem. Theme files are limited to 64 KiB.
+Invalid live edits keep the last working appearance and show an error in Theme
+settings. On startup, an invalid selected theme leaves the embedded original
+palette active. Files are never repaired or overwritten automatically.
+Theme files are limited to 64 KiB and require a nonempty `name`.
+
+## Custom keybindings
+
+Settings > Keybinds groups actions by context, including actions without a default
+key. Unbound rows show `-` and muted text. The Reference column shows namespaced
+action references such as `player.pause`; these are also accepted in
+`keybinds.json`, alongside the existing compact action IDs.
+Filter by action, reference, keystrokes or context. The action picker is searchable
+by name or reference. Double-click a row to edit it, or use
+Create keybinding to add another shortcut. Record up to four keystrokes or type
+a sequence such as `ctrl-k ctrl-s`. Escape can be recorded as a binding too.
+Sequences wait one second between keys. An exact binding that is also a sequence
+prefix waits until that timeout before running.
+
+Choose a predefined context or enter an expression using `&&`, `||`, `!` and
+parentheses. Available contexts are Application, Player, ClipLibrary, Settings,
+TextInput, Dialog, KeybindEditor, paused, playing, fullscreen, folder and selected.
+For example, `Player && (paused || !fullscreen)`. Input fields and modal dialogs
+require bindings that explicitly include TextInput or Dialog, respectively.
+More specific contexts take precedence; user bindings win ties with defaults.
+The editor warns about overlapping shortcuts and sequence prefixes.
+
+Only user additions, overrides and explicit removals are saved in
+`~/.spacer/keybinds.json`. Defaults remain in the application. Removing a default
+stores a disabled entry so it stays removed after restarting. Reset action
+removes that action's changes; Reset all leaves an empty list. The shortcut-help
+panel also reflects the effective bindings. There is no JSON editor in settings.
+Malformed keymap files are reported and left unchanged. Repair the file and
+restart Spacer before saving further changes.
 
 ## Headset audio routing
 

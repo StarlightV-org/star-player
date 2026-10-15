@@ -8,7 +8,7 @@ use components::{
     volume_controls::{VolumeControls, VolumeEvent},
 };
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, TITLE_BAR_HEIGHT, TitleBar,
+    ActiveTheme as _, Icon, IconName, TITLE_BAR_HEIGHT, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants},
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -29,6 +29,7 @@ mod clip_store;
 mod components;
 mod file_info;
 mod game_icons;
+mod keybinds;
 mod logging;
 mod media_keys;
 mod native_backdrop;
@@ -45,32 +46,6 @@ mod thumbnail_cache;
 mod todo_tests;
 mod window_cursor;
 
-const PLAYER_SHORTCUTS: &[(&str, &str)] = &[
-    ("Open media", "Ctrl+O"),
-    ("Play / pause", "Space / K"),
-    ("Play", "P"),
-    ("Pause", "Pause"),
-    ("Stop and rewind", "S"),
-    ("Seek 10 seconds", "Left / Right"),
-    ("Seek 60 seconds", "Shift+Left / Right"),
-    ("Start / end", "Home / End"),
-    ("Seek to 0 to 90%", "0 to 9"),
-    ("Previous / next frame", ", / ."),
-    ("Volume", "Up / Down"),
-    ("Mute", "M"),
-    ("Playback speed", "Shift+, / ."),
-    ("Reset speed", "R"),
-    ("Select audio track", "[ / ]"),
-    ("Track volume", "- / +"),
-    ("Toggle track", "A"),
-    ("Fullscreen", "F"),
-    ("Keyboard shortcuts", "H / ?"),
-    ("Reload theme", "Ctrl+Shift+T"),
-    ("Select all clips", "Ctrl+A"),
-    ("Delete selected clips", "Delete"),
-    ("Dismiss panels", "Esc"),
-];
-
 /// GPUI's texture upload expects BGRA, while our decoders produce RGBA.
 fn render_image(mut pixels: image::RgbaImage) -> Arc<RenderImage> {
     for pixel in pixels.pixels_mut() {
@@ -86,6 +61,51 @@ struct NavigationView {
     queue: Vec<PathBuf>,
     folder: bool,
     browser: BrowserView,
+}
+
+/// Keep shortcut capture above Root's dialog layer as well as the main view.
+struct ShortcutCapture;
+
+impl Render for ShortcutCapture {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+impl gpui_kit::base::RootPlugin for ShortcutCapture {
+    fn decorate(
+        &self,
+        surface: AnyElement,
+        root: &gpui_kit::base::Root,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> impl IntoElement {
+        let player = root.view().clone().downcast::<PlayerShell>().ok();
+        div()
+            .size_full()
+            .capture_key_down(move |event: &KeyDownEvent, window, cx| {
+                if let Some(player) = &player {
+                    let browser = player.read(cx).browser.clone();
+                    if window.has_active_dialog(cx)
+                        && browser.update(cx, |browser, cx| browser.record_keyboard_key(event, cx))
+                    {
+                        cx.stop_propagation();
+                    } else {
+                        player.update(cx, |player, cx| player.key(event, window, cx));
+                    }
+                }
+            })
+            .child(surface)
+    }
+}
+
+fn player_root(
+    player: Entity<PlayerShell>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<gpui_kit::base::Root> {
+    gpui_kit::base::Root::register_plugin(cx, |_, _| ShortcutCapture);
+    cx.new(|cx| gpui_kit::base::Root::new(player, window, cx).bg(rgba(0x00000000)))
 }
 
 struct PlayerShell {
@@ -141,7 +161,7 @@ impl PlayerShell {
             .h(TITLE_BAR_HEIGHT)
             .flex_shrink_0()
             .child(
-                TitleBar::new().bg(cx.theme().background).child(
+                TitleBar::new().bg(cx.theme().title_bar).child(
                     div()
                         .w_full()
                         .min_w_0()
@@ -288,6 +308,13 @@ impl PlayerShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        if !cx.has_global::<keybinds::Keymap>() {
+            cx.set_global(keybinds::Keymap::open(
+                clip_store::directory()
+                    .unwrap_or_default()
+                    .join("keybinds.json"),
+            ));
+        }
         let media_controls = cx.new(|_| MediaControls::default());
         let volume_controls = cx.new(VolumeControls::new);
         let seeker_bar = cx.new(|cx| SeekerBar::new(0.0, cx));
@@ -776,6 +803,15 @@ impl PlayerShell {
     }
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if theme::poll(cx) {
+            cx.notify();
+        }
+        if cx.has_global::<keybinds::Keymap>() {
+            let scope = self.key_scope(window, cx);
+            if let Some(action) = cx.global_mut::<keybinds::Keymap>().expire(&scope) {
+                self.run_action(&action, window, cx);
+            }
+        }
         self.browser.update(cx, |browser, cx| {
             browser.poll(self.path.is_none(), window, cx)
         });
@@ -839,21 +875,24 @@ impl PlayerShell {
             tracks.sync(&snapshot.tracks, self.selected_track, window, cx)
         });
         for action in self.media_keys.poll() {
-            use media_keys::MediaAction;
-            let command = match action {
-                MediaAction::Toggle => Command::Toggle,
-                MediaAction::Stop => Command::Stop,
-                MediaAction::Backward => Command::SeekRelative(-10.0),
-                MediaAction::Forward => Command::SeekRelative(10.0),
-                MediaAction::Mute => Command::SetMute(!self.snapshot.muted),
-                MediaAction::VolumeDown => {
-                    Command::SetVolume((self.snapshot.volume - 5.0).max(0.0))
-                }
-                MediaAction::VolumeUp => {
-                    Command::SetVolume((self.snapshot.volume + 5.0).min(100.0))
-                }
+            let key = match action {
+                media_keys::MediaAction::Toggle => "media-play-pause",
+                media_keys::MediaAction::Stop => "media-stop",
+                media_keys::MediaAction::Backward => "media-previous",
+                media_keys::MediaAction::Forward => "media-next",
+                _ => continue,
             };
-            self.command(command, cx);
+            if window.has_active_dialog(cx)
+                && self
+                    .browser
+                    .update(cx, |browser, cx| browser.record_media_key(key, cx))
+            {
+                continue;
+            }
+            let scope = self.key_scope(window, cx);
+            if let Some(action) = cx.global_mut::<keybinds::Keymap>().feed(key, scope).0 {
+                self.run_action(&action, window, cx);
+            }
         }
         self.controls_visible = controls_should_show(
             self.path.is_none()
@@ -876,114 +915,172 @@ impl PlayerShell {
         cx.notify();
     }
 
+    fn key_scope(&self, window: &mut Window, cx: &mut App) -> keybinds::Scope {
+        let mut scope = keybinds::Scope::new([
+            "Application",
+            if self.show_settings {
+                "Settings"
+            } else if self.path.is_some() {
+                "Player"
+            } else {
+                "ClipLibrary"
+            },
+        ]);
+        if self.path.is_some() && !self.show_settings {
+            scope.values.push(if self.snapshot.paused {
+                "paused"
+            } else {
+                "playing"
+            });
+        }
+        if window.is_fullscreen() {
+            scope.values.push("fullscreen");
+        }
+        if window.has_active_dialog(cx) {
+            scope.values.push("Dialog");
+        }
+        if window.has_focused_input(cx) {
+            scope.values.push("TextInput");
+        }
+        self.browser.read(cx).extend_scope(&mut scope);
+        scope
+    }
+
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_settings {
-            if event.keystroke.key == "escape" {
-                self.set_settings(false, window, cx);
-            }
+        if !cx.has_global::<keybinds::Keymap>() {
             return;
         }
+        let scope = self.key_scope(window, cx);
+        if self.rename_busy {
+            return;
+        }
+        let (action, consumed) = cx
+            .global_mut::<keybinds::Keymap>()
+            .feed(&keybinds::stroke(&event.keystroke), scope);
+        if let Some(action) = action {
+            self.run_action(&action, window, cx);
+        }
+        if consumed {
+            cx.stop_propagation();
+        }
+    }
+
+    fn run_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.reveal_controls(cx);
-        let key = event.keystroke.key.as_str();
-        let modifiers = &event.keystroke.modifiers;
-        if modifiers.control && key == "o" {
-            self.open(window, cx);
-            cx.stop_propagation();
-            return;
-        }
-        if modifiers.control && modifiers.shift && key == "t" {
-            theme::apply(cx);
-            cx.notify();
-            cx.stop_propagation();
-            return;
-        }
-        if modifiers.control || modifiers.alt || modifiers.platform {
-            return;
-        }
-        if self.path.is_none() {
-            if key == "escape" && !modifiers.shift {
-                self.browser.update(cx, |browser, cx| browser.deselect(cx));
-                cx.stop_propagation();
+        let command = match action {
+            "open" => {
+                self.open(window, cx);
+                None
             }
-            return;
-        }
-        let command = match key {
-            "space" | "k" => Some(Command::Toggle),
-            "p" => Some(Command::Play),
+            "settings" => {
+                self.set_settings(true, window, cx);
+                None
+            }
+            "close_settings" => {
+                self.set_settings(false, window, cx);
+                None
+            }
+            "reload_theme" => {
+                theme::apply(cx);
+                None
+            }
+            "toggle" => Some(Command::Toggle),
+            "play" => Some(Command::Play),
             "pause" => Some(Command::Pause),
-            "s" => Some(Command::Stop),
-            "left" | "j" => Some(Command::SeekRelative(if modifiers.shift {
-                -60.0
-            } else {
-                -10.0
-            })),
-            "right" | "l" => Some(Command::SeekRelative(if modifiers.shift {
-                60.0
-            } else {
-                10.0
-            })),
-            "home" => Some(Command::SeekAbsolute(0.0)),
+            "stop" => Some(Command::Stop),
+            "seek_back" => Some(Command::SeekRelative(-10.0)),
+            "seek_forward" => Some(Command::SeekRelative(10.0)),
+            "seek_back_long" => Some(Command::SeekRelative(-60.0)),
+            "seek_forward_long" => Some(Command::SeekRelative(60.0)),
+            "start" => Some(Command::SeekAbsolute(0.0)),
             "end" => Some(Command::SeekAbsolute(self.snapshot.duration)),
-            "," if !modifiers.shift && self.snapshot.paused => Some(Command::FrameBackStep),
-            "." if !modifiers.shift && self.snapshot.paused => Some(Command::FrameStep),
-            "m" => Some(Command::SetMute(!self.snapshot.muted)),
-            "up" => Some(Command::SetVolume((self.snapshot.volume + 5.0).min(100.0))),
-            "down" => Some(Command::SetVolume((self.snapshot.volume - 5.0).max(0.0))),
-            ">" | "." if modifiers.shift => {
-                Some(Command::SetSpeed((self.snapshot.speed + 0.25).min(4.0)))
-            }
-            "<" | "," if modifiers.shift => {
-                Some(Command::SetSpeed((self.snapshot.speed - 0.25).max(0.25)))
-            }
-            "r" => Some(Command::SetSpeed(1.0)),
-            "[" => {
+            "frame_back" => Some(Command::FrameBackStep),
+            "frame_forward" => Some(Command::FrameStep),
+            "mute" => Some(Command::SetMute(!self.snapshot.muted)),
+            "volume_up" => Some(Command::SetVolume((self.snapshot.volume + 5.0).min(100.0))),
+            "volume_down" => Some(Command::SetVolume((self.snapshot.volume - 5.0).max(0.0))),
+            "speed_up" => Some(Command::SetSpeed((self.snapshot.speed + 0.25).min(4.0))),
+            "speed_down" => Some(Command::SetSpeed((self.snapshot.speed - 0.25).max(0.25))),
+            "speed_reset" => Some(Command::SetSpeed(1.0)),
+            "track_previous" => {
                 self.selected_track = self.selected_track.saturating_sub(1);
                 None
             }
-            "]" => {
+            "track_next" => {
                 self.selected_track =
                     (self.selected_track + 1).min(self.snapshot.tracks.len().saturating_sub(1));
                 None
             }
-            "-" | "=" | "+" | "a" => self.snapshot.tracks.get(self.selected_track).map(|track| {
-                let gain = match key {
-                    "-" => (track.gain - 0.05).max(0.0),
-                    "a" => {
-                        if track.gain > 0.0 {
-                            0.0
-                        } else {
-                            1.0
+            "track_down" | "track_up" | "track_toggle" => {
+                self.snapshot.tracks.get(self.selected_track).map(|track| {
+                    let gain = match action {
+                        "track_down" => (track.gain - 0.05).max(0.0),
+                        "track_up" => (track.gain + 0.05).min(1.0),
+                        _ => {
+                            if track.gain > 0.0 {
+                                0.0
+                            } else {
+                                1.0
+                            }
                         }
-                    }
-                    _ => (track.gain + 0.05).min(1.0),
-                };
-                Command::SetTrackGain { id: track.id, gain }
-            }),
-            "f" => {
+                    };
+                    Command::SetTrackGain { id: track.id, gain }
+                })
+            }
+            "fullscreen" => {
                 window.toggle_fullscreen();
                 None
             }
-            "escape" => {
+            "dismiss" => {
                 self.show_help = false;
                 self.show_info = false;
                 self.show_tracks = false;
                 None
             }
-            "h" | "?" => {
+            "help" => {
                 self.show_help = !self.show_help;
                 self.show_info = false;
                 None
             }
-            digit if digit.len() == 1 && digit.as_bytes()[0].is_ascii_digit() => key
+            "info" => {
+                self.show_info = !self.show_info;
+                None
+            }
+            "tracks" => {
+                self.show_tracks = !self.show_tracks;
+                None
+            }
+            "library" => {
+                self.back_to_library(window, cx);
+                None
+            }
+            "rename" if self.path.is_some() && !self.show_settings => {
+                self.rename_current(window, cx);
+                None
+            }
+            "history_back" | "history_forward" => {
+                self.navigate_history(action == "history_forward", window, cx);
+                None
+            }
+            "previous_clip" | "next_clip" => {
+                if let Some(path) = self.adjacent(action == "next_clip") {
+                    self.open_file_view(path, cx);
+                }
+                None
+            }
+            id if id.starts_with("seek_") => id[5..]
                 .parse::<u8>()
                 .ok()
                 .map(|n| Command::SeekAbsolute(self.snapshot.duration * n as f64 / 10.0)),
-            _ => return,
+            id => {
+                self.browser
+                    .update(cx, |browser, cx| browser.run_library_action(id, window, cx));
+                None
+            }
         };
         if let Some(command) = command {
             self.command(command, cx);
         }
-        cx.stop_propagation();
         cx.notify();
     }
 
@@ -1138,7 +1235,7 @@ impl Render for PlayerShell {
             .relative()
             .size_full()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::key))
+            .capture_key_down(cx.listener(Self::key))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.controls_dragging = event.pressed_button == Some(MouseButton::Left);
                 this.update_navigation_hover(window, cx);
@@ -1560,10 +1657,13 @@ impl Render for PlayerShell {
                 |shell| {
                     shell.child(
                         div()
+                            .id("keyboard-help")
                             .absolute()
                             .top(px(76.0))
                             .right_4()
                             .w(px(360.0))
+                            .max_h(window.viewport_size().height - px(100.))
+                            .overflow_y_scroll()
                             .occlude()
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
                             .p_4()
@@ -1595,7 +1695,7 @@ impl Render for PlayerShell {
                                             })),
                                     ),
                             )
-                            .children(PLAYER_SHORTCUTS.iter().copied().map(
+                            .children(cx.global::<keybinds::Keymap>().hints().into_iter().map(
                                 |(action, shortcut)| {
                                     div()
                                         .flex()
@@ -1668,6 +1768,11 @@ fn main() {
     application().with_assets(app_assets::AppAssets).run(|cx| {
         init(cx);
         theme::apply(cx);
+        cx.set_global(keybinds::Keymap::open(
+            clip_store::directory()
+                .unwrap_or_default()
+                .join("keybinds.json"),
+        ));
         let options = WindowOptions {
             window_background: WindowBackgroundAppearance::Transparent,
             titlebar: Some(TitlebarOptions {
@@ -1691,7 +1796,7 @@ fn main() {
                 }
                 player
             });
-            cx.new(|cx| gpui_kit::base::Root::new(player, window, cx).bg(rgba(0x00000000)))
+            player_root(player, window, cx)
         })
         .expect("Failed to open player window");
         cx.activate(true);

@@ -23,6 +23,7 @@ use std::{
     sync::Arc,
     time::SystemTime,
 };
+mod settings;
 
 pub enum BrowserEvent {
     Play(PathBuf, Vec<PathBuf>),
@@ -90,6 +91,7 @@ pub struct ClipBrowser {
     audio_overrides: HashMap<String, std::collections::BTreeMap<i64, f64>>,
     pub settings: bool,
     rename_subscription: Option<Subscription>,
+    settings_state: Option<settings::SettingsState>,
 }
 impl EventEmitter<BrowserEvent> for ClipBrowser {}
 
@@ -99,6 +101,9 @@ impl ClipBrowser {
     }
     #[cfg(test)]
     pub fn for_test(directory: PathBuf, cx: &mut Context<Self>) -> Self {
+        cx.set_global(crate::keybinds::Keymap::open(
+            directory.join("keybinds.json"),
+        ));
         Self::with_worker(
             false,
             LibraryWorker::for_test(directory.clone()),
@@ -160,6 +165,7 @@ impl ClipBrowser {
             audio_overrides: HashMap::new(),
             settings: false,
             rename_subscription: None,
+            settings_state: None,
         }
     }
 
@@ -1013,7 +1019,7 @@ impl ClipBrowser {
 impl Render for ClipBrowser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.settings {
-            return self.render_settings(cx).into_any_element();
+            return self.render_settings(window, cx).into_any_element();
         }
         let compact = window.viewport_size().width < px(1000.);
         let menu_owner = cx.entity();
@@ -1035,31 +1041,6 @@ impl Render for ClipBrowser {
             .flex_col()
             .bg(cx.theme().background)
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.modifiers.control && event.keystroke.key == "a" {
-                    this.selected = this
-                        .rows
-                        .iter()
-                        .filter_map(|r| {
-                            if let Row::Clip(c) = r {
-                                Some(c.path.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    cx.notify();
-                    cx.stop_propagation();
-                } else if event.keystroke.key == "escape"
-                    && event.keystroke.modifiers == Modifiers::default()
-                {
-                    this.deselect(cx);
-                    cx.stop_propagation();
-                } else if event.keystroke.key == "delete" {
-                    this.confirm_delete(window, cx);
-                    cx.stop_propagation();
-                }
-            }))
             .child(
                 div()
                     .flex()
@@ -1436,18 +1417,24 @@ impl ClipBrowser {
         });
     }
 
-    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_library_settings(&self, query: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let enabled = self.config.clip_discovery == Discovery::Enabled;
         let steam_enabled = self.config.steam_discovery == Discovery::Enabled;
         let steam_busy = self.detecting_icons || self.steam_scan_pending.is_some();
-        div().id("settings-page").size_full().overflow_y_scroll().p_6().flex().flex_col().gap_4()
-            .child(div().flex().items_center().gap_3()
-                .child(Button::new("settings-back").ghost().icon(IconName::ChevronLeft).label("Back")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserEvent::CloseSettings))))
-                .child(div().text_xl().child("Settings")))
-            .child(div().text_lg().child("Listed folders"))
+        let folders = "clip library folders monitored paths add remove".contains(query)
+            || self
+                .config
+                .clip_directories
+                .iter()
+                .any(|p| p.to_string_lossy().to_lowercase().contains(query));
+        let overlay =
+            "clip library nvidia overlay automatic folder discovery detect".contains(query);
+        let steam = "clip library steam game icons local search permission cache".contains(query);
+        div().flex().flex_col().gap_3()
+            .when(folders, |s| s
+            .child(div().text_lg().child("Folders"))
             .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("Removing a folder only removes it from the library. Your files and watched history are kept."))
+                .child("Removing a folder keeps its files and watched history."))
             .children(self.config.clip_directories.iter().enumerate().map(|(index, path)| {
                 let remove = path.clone();
                 div().flex().items_center().gap_3().p_3().border_1().border_color(cx.theme().border).rounded_lg()
@@ -1455,49 +1442,44 @@ impl ClipBrowser {
                     .child(div().flex_1().min_w_0()
                         .child(div().truncate().child(crate::clip_store::display_path(path)))
                         .child(div().text_xs().text_color(cx.theme().muted_foreground)
-                            .child(if path.is_dir() { "Monitored" } else { "Unavailable. Scanning resumes when the drive reconnects." })))
+                            .child(if path.is_dir() { "Monitored" } else { "Unavailable. Waiting for the drive." })))
                     .child(Button::new(("remove-folder", index)).ghost().label("Remove")
                         .on_click(cx.listener(move |this, _, _, _| this.worker.send(Request::RemoveFolder(remove.clone())))))
             }))
             .when(self.config.clip_directories.is_empty(), |s| s.child("No folders added yet."))
             .child(Button::new("settings-add-folder").ghost().icon(IconName::FolderOpen).label("Add folder")
-                .on_click(cx.listener(|this, _, window, cx| this.add_folder(window, cx))))
-            .child(div().mt_4().text_lg().child("NVIDIA folder discovery"))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("Automatically discover NVIDIA Overlay's recording folder. Turning this off does not stop scanning or watching listed folders."))
+                .on_click(cx.listener(|this, _, window, cx| this.add_folder(window, cx)))))
+            .when(overlay, |s| s
+            .child(div().mt_4().text_lg().child("NVIDIA Overlay"))
+            .child(settings::setting_row("Automatic folder discovery", "Find NVIDIA's recording folder. Listed folders stay monitored.", cx)
+                .child(gpui_kit::component::switch::Switch::new("automatic-discovery").checked(enabled)
+                    .accessibility_label("Automatic folder discovery")
+                    .on_click(cx.listener(move |this, next: &bool, _, _| {
+                        this.steam_prompt_pending = *next;
+                        this.worker.send(Request::Consent(*next));
+                    }))))
             .child(div().flex().items_center().gap_3()
-                .child(Checkbox::new("automatic-discovery").label("Automatic discovery").checked(enabled)
-                    .on_click(cx.listener(move |this, _, _, _| {
-                        this.steam_prompt_pending = !enabled;
-                        this.worker.send(Request::Consent(!enabled));
-                    })))
                 .child(Button::new("settings-detect").ghost().label("Detect now")
                     .on_click(cx.listener(|this, _, _, _| this.worker.send(Request::Detect)))))
             .child(div().text_xs().text_color(cx.theme().muted_foreground)
-                .child(if enabled { "Enabled. NVIDIA's current folder may be added again if removed." } else { "Disabled. Manual detection is still available." }))
-            .child(div().mt_4().text_lg().child("Steam game icons"))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("Spacer reads local Steam game manifests, Steam's image cache, and Steam shortcuts on your desktop and Start menu. Searches run in the background without network requests or changes to Steam files. There are no automatic Steam searches at startup."))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                .child("Available icons are copied to .spacer/game-icons/images as PNGs. The game catalog and folder assignments are saved alongside them. Icons remain after uninstalling games and are separate from the video thumbnail cache. Right-click a game folder to set a custom icon, select another game's icon, or restore its assigned icon."))
-            .child(Checkbox::new("steam-search-permission").label("Allow local Steam game searches").checked(steam_enabled)
-                .disabled(steam_busy).on_click(cx.listener(move |this, _, window, cx| {
-                    if steam_enabled { this.worker.send(Request::SteamConsent(false)); }
+                .child(if enabled { "Enabled. NVIDIA's current folder may be added again if removed." } else { "Disabled. Manual detection is still available." })))
+            .when(steam, |s| s
+            .child(div().mt_4().text_lg().child("Steam"))
+            .child(settings::setting_row("Allow local game searches", "Find Steam game icons locally. No network requests or startup searches.", cx)
+                .child(gpui_kit::component::switch::Switch::new("steam-search-permission").checked(steam_enabled)
+                .accessibility_label("Allow local game searches")
+                .disabled(steam_busy).on_click(cx.listener(move |this, next: &bool, window, cx| {
+                    if !*next { this.worker.send(Request::SteamConsent(false)); }
                     else { this.approve_steam_scan(None, window, cx); }
-                })))
+                }))))
             .child(div().flex().items_center().gap_3()
                 .child(Button::new("search-steam-games").ghost().label(if steam_busy { "Searching…" } else { "Search now" })
                     .disabled(steam_busy).on_click(cx.listener(|this, _, window, cx| this.approve_steam_scan(None, window, cx))))
                 .child(Button::new("choose-steam-folder").ghost().label("Choose Steam folder…")
                     .disabled(steam_busy).on_click(cx.listener(|this, _, window, cx| this.select_steam_folder(window, cx)))))
             .child(format!("{} detected games, {} with cached icons", self.icons.games.len(), self.icons.games.values().filter(|g| g.image.is_some()).count()))
-            .child(div().mt_4().text_lg().child("Keyboard shortcuts"))
-            .children(crate::PLAYER_SHORTCUTS.iter().map(|(action, shortcut)| {
-                div().flex().justify_between().max_w(px(600.)).text_sm().gap_4()
-                    .child(*action).child(*shortcut)
-            }))
-            .child(div().mt_4().text_lg().child("About"))
-            .child(format!("Spacer {} · Embedded libmpv", env!("CARGO_PKG_VERSION")))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Cached icons stay available after uninstalling games. Right-click a game folder to change its icon.")))
+            .when(!folders && !overlay && !steam, |s| s.child("No matching settings on this page."))
     }
 }
 
