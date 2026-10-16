@@ -6,7 +6,7 @@ pub fn position(
     duration: f64,
     position: f64,
 ) -> Option<f64> {
-    (policy.includes(duration) && position.is_finite() && position > 0.0 && position < duration)
+    (policy.includes(duration) && position.is_finite() && position > 15.0 && position < duration)
         .then_some(position)
 }
 
@@ -48,6 +48,10 @@ mod tests {
         let policy = RememberPlayback::default();
         assert_eq!(position(policy, 600.0, 30.0), None);
         assert_eq!(position(policy, 600.1, 30.0), Some(30.0));
+        for value in [0.1, 14.9, 15.0] {
+            assert_eq!(position(policy, 700.0, value), None);
+        }
+        assert_eq!(position(policy, 700.0, 15.01), Some(15.01));
         for value in [0.0, -1.0, 700.0, 701.0, f64::NAN, f64::INFINITY] {
             assert_eq!(position(policy, 700.0, value), None);
         }

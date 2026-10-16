@@ -154,12 +154,14 @@ impl Render for SeekerBar {
         // native video. No permanently reserved thumbnail strip is needed.
         div()
             .flex()
+            .w_full()
+            .min_w_0()
             .items_center()
             .h(px(24.0))
-            .gap_3()
+            .gap_2()
             .child(
                 div()
-                    .w(px(56.0))
+                    .flex_shrink_0()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(timestamp(self.position)),
@@ -223,55 +225,58 @@ impl Render for SeekerBar {
                         let left = ((seconds / self.duration.max(1.0)) as f32 * width - 120.0)
                             .clamp(0.0, (width - 240.0).max(0.0));
                         bar.child(
-                            div()
-                                .absolute()
-                                .bottom(px(38.0))
-                                .left(px(left))
-                                .w(px(240.0))
-                                .occlude()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                )
-                                .rounded_lg()
-                                .overflow_hidden()
-                                .bg(cx.theme().popover.opacity(0.96))
-                                .shadow_lg()
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .when_some(self.thumbnail.clone(), |popup, image| {
-                                    popup.child(
-                                        img(image)
-                                            .w_full()
-                                            .h(px(135.0))
-                                            .object_fit(ObjectFit::Contain),
+                            deferred(
+                                div()
+                                    .absolute()
+                                    .bottom(px(38.0))
+                                    .left(px(left))
+                                    .w(px(240.0))
+                                    .occlude()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
                                     )
-                                })
-                                .when(
-                                    self.thumbnail.is_none() && self.preview_error.is_none(),
-                                    |popup| {
+                                    .rounded_lg()
+                                    .overflow_hidden()
+                                    .bg(cx.theme().popover)
+                                    .shadow_lg()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .when_some(self.thumbnail.clone(), |popup, image| {
                                         popup.child(
-                                            div()
-                                                .h(px(80.0))
-                                                .p_3()
-                                                .text_xs()
-                                                .child("Loading preview..."),
+                                            img(image)
+                                                .w_full()
+                                                .h(px(135.0))
+                                                .object_fit(ObjectFit::Contain),
                                         )
-                                    },
-                                )
-                                .child(div().p_2().text_xs().child(timestamp(
-                                    if self.thumbnail.is_some() {
-                                        self.thumbnail_time
-                                    } else {
-                                        seconds
-                                    },
-                                ))),
+                                    })
+                                    .when(
+                                        self.thumbnail.is_none() && self.preview_error.is_none(),
+                                        |popup| {
+                                            popup.child(
+                                                div()
+                                                    .h(px(80.0))
+                                                    .p_3()
+                                                    .text_xs()
+                                                    .child("Loading preview..."),
+                                            )
+                                        },
+                                    )
+                                    .child(div().p_2().text_xs().child(timestamp(
+                                        if self.thumbnail.is_some() {
+                                            self.thumbnail_time
+                                        } else {
+                                            seconds
+                                        },
+                                    ))),
+                            )
+                            .with_priority(10),
                         )
                     }),
             )
             .child(
                 div()
-                    .w(px(56.0))
+                    .flex_shrink_0()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(timestamp(self.duration)),

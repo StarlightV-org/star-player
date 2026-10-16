@@ -151,6 +151,8 @@ struct PlayerShell {
     title_focus: FocusHandle,
     show_tracks: bool,
     controls_visible: bool,
+    controls_opacity: f32,
+    controls_frame: Instant,
     controls_dragging: bool,
     last_activity: Instant,
     video_click: Option<Task<()>>,
@@ -441,9 +443,6 @@ impl PlayerShell {
                     this.command(
                         match event {
                             MediaControlsEvent::Toggle => Command::Toggle,
-                            MediaControlsEvent::SeekBackward => Command::SeekRelative(-10.0),
-                            MediaControlsEvent::SeekForward => Command::SeekRelative(10.0),
-                            MediaControlsEvent::Stop => Command::Stop,
                         },
                         cx,
                     );
@@ -561,6 +560,8 @@ impl PlayerShell {
             title_focus: cx.focus_handle(),
             show_tracks: false,
             controls_visible: true,
+            controls_opacity: 1.0,
+            controls_frame: Instant::now(),
             controls_dragging: false,
             last_activity: Instant::now(),
             video_click: None,
@@ -685,6 +686,7 @@ impl PlayerShell {
         }
         if !self.controls_visible {
             self.controls_visible = true;
+            self.controls_frame = Instant::now();
             cx.notify();
         }
     }
@@ -1002,7 +1004,7 @@ impl PlayerShell {
                 self.run_action(&action, window, cx);
             }
         }
-        self.controls_visible = controls_should_show(
+        let controls_visible = controls_should_show(
             self.path.is_none()
                 || self.show_settings
                 || self.show_info
@@ -1012,12 +1014,16 @@ impl PlayerShell {
                 || self.title_focus.is_focused(window)
                 || self.rename_busy
                 || self.snapshot.paused
-                || self.resume_prompt.is_some()
+                || self.volume_controls.read(cx).interacting(window, cx)
                 || self.hover_navigation.is_some()
                 || self.snapshot.error.is_some(),
             self.controls_dragging,
             self.last_activity.elapsed(),
         );
+        if self.controls_visible != controls_visible {
+            self.controls_visible = controls_visible;
+            self.controls_frame = Instant::now();
+        }
         if let Some(host) = &self.native_video {
             host.set_cursor_hidden(!self.controls_visible);
         }
@@ -1309,6 +1315,21 @@ impl PlayerShell {
 
 impl Render for PlayerShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = Instant::now();
+        self.controls_opacity = advance_controls_opacity(
+            self.controls_opacity,
+            self.controls_visible,
+            now.saturating_duration_since(self.controls_frame),
+            reduced_motion(),
+        );
+        self.controls_frame = now;
+        let target = if self.controls_visible { 1.0 } else { 0.0 };
+        if self.controls_opacity != target {
+            window.request_animation_frame();
+        }
+        let opacity =
+            self.controls_opacity * self.controls_opacity * (3.0 - 2.0 * self.controls_opacity);
+        let controls_offset = 8.0 - (1.0 - opacity) * 8.0;
         let info_trigger_bounds = Rc::new(Cell::new(Bounds::default()));
         let mixer_trigger_bounds = Rc::new(Cell::new(Bounds::default()));
         let shell = cx.weak_entity();
@@ -1439,13 +1460,14 @@ impl Render for PlayerShell {
                 )
             })
             .when(
-                self.controls_visible && self.path.is_some() && !self.show_settings,
+                self.controls_opacity > 0.0 && self.path.is_some() && !self.show_settings,
                 |shell| {
                     shell
                         .child(
                             div()
                                 .absolute()
-                                .top_4()
+                                .top(px(controls_offset + 8.0))
+                                .opacity(opacity)
                                 .left_4()
                                 .right_4()
                                 .flex()
@@ -1556,48 +1578,43 @@ impl Render for PlayerShell {
                                 .occlude()
                                 .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
                                 .absolute()
-                                .bottom_4()
-                                .left_4()
-                                .right_4()
+                                .bottom(px(controls_offset))
+                                .opacity(opacity)
+                                .left_2()
+                                .right_2()
                                 .flex()
-                                .flex_col()
                                 .gap_2()
-                                .px_4()
-                                .py_3()
+                                .px_2()
+                                .py_1()
                                 .rounded_xl()
-                                .bg(cx.theme().background.opacity(0.94))
+                                .bg(cx.theme().background.opacity(0.70))
                                 .border_1()
                                 .border_color(cx.theme().border)
                                 .shadow_lg()
-                                .child(self.seeker_bar.clone())
                                 .child(
                                     div()
                                         .flex()
+                                        .w_full()
+                                        .min_w_0()
                                         .items_center()
                                         .justify_between()
-                                        .gap_3()
+                                        .gap_2()
                                         .child(
                                             div()
                                                 .flex()
                                                 .items_center()
-                                                .gap_3()
+                                                .gap_1()
                                                 .child(self.media_controls.clone())
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child(format!(
-                                                            "{:.2}×",
-                                                            self.snapshot.speed
-                                                        )),
-                                                ),
+                                                .child(self.volume_controls.clone())
+                                                .flex_shrink_0(),
                                         )
+                                        .child(div().flex_1().min_w_0().child(self.seeker_bar.clone()))
                                         .child(
                                             div()
                                                 .flex()
                                                 .items_center()
                                                 .gap_2()
-                                                .child(self.volume_controls.clone())
+                                                .flex_shrink_0()
                                                 .when(
                                                     !self.snapshot.tracks.is_empty(),
                                                     |controls| {
@@ -1889,6 +1906,38 @@ fn measure_bounds(bounds: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
         .size_full()
 }
 
+fn advance_controls_opacity(current: f32, visible: bool, elapsed: Duration, reduced: bool) -> f32 {
+    let target = if visible { 1.0 } else { 0.0 };
+    if reduced {
+        return target;
+    }
+    let step = elapsed.as_secs_f32() / 0.18;
+    if visible {
+        (current + step).min(target)
+    } else {
+        (current - step).max(target)
+    }
+}
+
+fn reduced_motion() -> bool {
+    #[cfg(windows)]
+    {
+        // SPI_GETCLIENTAREAANIMATION reflects Windows' animation preference.
+        let mut enabled: i32 = 1;
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
+                0x1042,
+                0,
+                (&mut enabled as *mut i32).cast(),
+                0,
+            );
+        }
+        enabled == 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 fn controls_should_show(persistent: bool, interacting: bool, idle: Duration) -> bool {
     persistent || interacting || idle < Duration::from_secs(3)
 }
@@ -1904,7 +1953,27 @@ fn double_click_interval() -> Duration {
 
 #[cfg(test)]
 mod styling_tests {
-    use super::controls_should_show;
+    use super::{advance_controls_opacity, controls_should_show};
+
+    #[test]
+    fn controls_animation_reverses_without_jumping_and_respects_reduced_motion() {
+        let half = Duration::from_millis(90);
+        let hidden = advance_controls_opacity(1.0, false, half, false);
+        assert!((hidden - 0.5).abs() < 0.001);
+        assert_eq!(advance_controls_opacity(hidden, true, half, false), 1.0);
+        assert_eq!(
+            advance_controls_opacity(1.0, false, Duration::from_secs(1), false),
+            0.0
+        );
+        assert_eq!(
+            advance_controls_opacity(0.4, true, Duration::ZERO, true),
+            1.0
+        );
+        assert_eq!(
+            advance_controls_opacity(0.4, false, Duration::ZERO, true),
+            0.0
+        );
+    }
     use std::time::Duration;
 
     #[test]
