@@ -173,12 +173,25 @@ impl PlayerShell {
                 TitleBar::new().bg(cx.theme().title_bar).child(
                     div()
                         .w_full()
+                        .h_full()
                         .min_w_0()
                         .flex()
                         .items_center()
                         .gap_2()
                         .child(img("spacer/icon.png").w(px(20.)).h(px(20.)))
-                        .child("Spacer")
+                        .child(
+                            div()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .line_height(px(20.))
+                                .whitespace_nowrap()
+                                .child("Spacer")
+                                .when(cfg!(debug_assertions), |label| {
+                                    label.child(div().text_color(cx.theme().primary).child("DEV"))
+                                }),
+                        )
                         .child(div().flex_1())
                         .child(
                             div()
