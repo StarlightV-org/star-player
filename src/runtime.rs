@@ -30,8 +30,17 @@ fn decoder_path() -> Result<PathBuf, String> {
     if let Some(path) = READY.get() {
         return Ok(path.clone());
     }
-    let home = dirs::home_dir().ok_or("Unable to locate the user's home directory")?;
-    let root = home.join(".spacer").join("runtime");
+    #[cfg(not(test))]
+    let root = crate::clip_store::directory()?.join("runtime");
+    // Native decoder tests must not migrate or write the user's real profile.
+    #[cfg(test)]
+    let root = {
+        static TEST_DATA: OnceLock<tempfile::TempDir> = OnceLock::new();
+        TEST_DATA
+            .get_or_init(|| tempfile::tempdir().expect("Temporary decoder test cache"))
+            .path()
+            .join("runtime")
+    };
     fs::create_dir_all(&root).map_err(|e| format!("Cannot create {}: {e}", root.display()))?;
     let destination = root.join(BUNDLE_ID);
     install_at(&root, &destination)?;
@@ -44,7 +53,7 @@ fn install_at(root: &Path, destination: &Path) -> Result<(), String> {
     if destination.exists() {
         return verify(destination).map_err(|e| {
             format!(
-                "Bundled decoder cache is invalid: {e}. Remove {} and restart Spacer to restore it",
+                "Bundled decoder cache is invalid: {e}. Remove {} and restart StarPlayer to restore it",
                 destination.display()
             )
         });

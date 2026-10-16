@@ -1956,12 +1956,14 @@ mod tests {
     /// Probe a user-supplied file with the bundled decoder, without physical
     /// playback or external tools. Both paths must be explicitly supplied.
     #[test]
-    #[ignore = "requires SPACER_AUDIO_PROBE and SPACER_AUDIO_PROBE_OUTPUT"]
+    #[ignore = "requires STAR_PLAYER_AUDIO_PROBE and STAR_PLAYER_AUDIO_PROBE_OUTPUT"]
     fn diagnose_audio_file() {
-        let path =
-            PathBuf::from(std::env::var_os("SPACER_AUDIO_PROBE").expect("Set SPACER_AUDIO_PROBE"));
+        let path = PathBuf::from(
+            std::env::var_os("STAR_PLAYER_AUDIO_PROBE").expect("Set STAR_PLAYER_AUDIO_PROBE"),
+        );
         let output = PathBuf::from(
-            std::env::var_os("SPACER_AUDIO_PROBE_OUTPUT").expect("Set SPACER_AUDIO_PROBE_OUTPUT"),
+            std::env::var_os("STAR_PLAYER_AUDIO_PROBE_OUTPUT")
+                .expect("Set STAR_PLAYER_AUDIO_PROBE_OUTPUT"),
         );
         let mut player =
             Player::new_with_options(Arc::new(Mailbox::new()), &[("ao", "null"), ("vid", "no")])
@@ -1994,10 +1996,12 @@ mod tests {
     #[test]
     #[ignore = "requires explicit media/report paths; opens muted physical output"]
     fn diagnose_headset_backends() {
-        let path =
-            PathBuf::from(std::env::var_os("SPACER_AUDIO_PROBE").expect("Set SPACER_AUDIO_PROBE"));
+        let path = PathBuf::from(
+            std::env::var_os("STAR_PLAYER_AUDIO_PROBE").expect("Set STAR_PLAYER_AUDIO_PROBE"),
+        );
         let output = PathBuf::from(
-            std::env::var_os("SPACER_AUDIO_PROBE_OUTPUT").expect("Set SPACER_AUDIO_PROBE_OUTPUT"),
+            std::env::var_os("STAR_PLAYER_AUDIO_PROBE_OUTPUT")
+                .expect("Set STAR_PLAYER_AUDIO_PROBE_OUTPUT"),
         );
         let mut player = Player::new_with_options(
             Arc::new(Mailbox::new()),

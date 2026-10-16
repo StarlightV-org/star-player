@@ -178,7 +178,7 @@ impl PlayerShell {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(img("spacer/icon.png").w(px(20.)).h(px(20.)))
+                        .child(img("star-player/icon.png").w(px(20.)).h(px(20.)))
                         .child(
                             div()
                                 .h_full()
@@ -187,7 +187,7 @@ impl PlayerShell {
                                 .gap_2()
                                 .line_height(px(20.))
                                 .whitespace_nowrap()
-                                .child("Spacer")
+                                .child("StarPlayer")
                                 .when(cfg!(debug_assertions), |label| {
                                     label.child(div().text_color(cx.theme().primary).child("DEV"))
                                 }),
@@ -1375,7 +1375,7 @@ impl Render for PlayerShell {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Spacer".into());
+            .unwrap_or_else(|| "StarPlayer".into());
         let content = div()
             .id("player")
             .relative()
@@ -2000,7 +2000,17 @@ mod styling_tests {
 
 fn main() {
     logging::attach_parent_terminal();
-    logging::Print(logging::Level::Info, "Starting Spacer");
+    logging::Print(logging::Level::Info, "Starting StarPlayer");
+    if let Err(error) = clip_store::directory() {
+        logging::Print(logging::Level::Error, &error);
+        #[cfg(windows)]
+        rfd::MessageDialog::new()
+            .set_title("StarPlayer could not open its data")
+            .set_description(&error)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+        std::process::exit(1);
+    }
     application().with_assets(app_assets::AppAssets).run(|cx| {
         init(cx);
         theme::apply(cx);
@@ -2012,7 +2022,7 @@ fn main() {
         let options = WindowOptions {
             window_background: WindowBackgroundAppearance::Transparent,
             titlebar: Some(TitlebarOptions {
-                title: Some("Spacer".into()),
+                title: Some("StarPlayer".into()),
                 ..TitleBar::title_bar_options()
             }),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -2050,15 +2060,15 @@ mod overlay_tests {
     };
 
     #[test]
-    #[ignore = "interactive GPUI overlay hit-testing with SPACER_AUDIO_PROBE media"]
+    #[ignore = "interactive GPUI overlay hit-testing with STAR_PLAYER_AUDIO_PROBE media"]
     fn mixer_clicks_do_not_control_video() {
         use gpui_kit::{
             MouseButton, MouseDownEvent, MouseUpEvent, WindowBackgroundAppearance, WindowOptions,
             application, init, point, px, rgba,
         };
         let path = PathBuf::from(
-            std::env::var_os("SPACER_AUDIO_PROBE")
-                .expect("Set SPACER_AUDIO_PROBE to the test media"),
+            std::env::var_os("STAR_PLAYER_AUDIO_PROBE")
+                .expect("Set STAR_PLAYER_AUDIO_PROBE to the test media"),
         );
         let result = Arc::new(Mutex::new(None));
         let report = result.clone();

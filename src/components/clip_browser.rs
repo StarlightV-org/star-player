@@ -363,7 +363,7 @@ impl ClipBrowser {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let yes = yes.clone(); let no = no.clone();
             alert.title("Allow NVIDIA Overlay folder discovery?")
-                .description("Spacer can read NVIDIA Overlay's gallery location and watch that folder for clips. Your choice is saved locally.")
+                .description("StarPlayer can read NVIDIA Overlay's gallery location and watch that folder for clips. Your choice is saved locally.")
                 .confirm().ok_text("Detect clips").cancel_text("Not now").close_button(false)
                 .on_ok(move |_, _, cx| { let _ = yes.update(cx, |this, _| {
                     this.steam_prompt_pending = true;
@@ -1291,7 +1291,7 @@ impl ClipBrowser {
             let decline = decline.clone();
             let root = root.clone();
             alert.title("Search for local Steam games?")
-                .description("Spacer can find installed Steam games and use their local icons for your clip folders. Your choice is saved locally.")
+                .description("StarPlayer can find installed Steam games and use their local icons for your clip folders. Your choice is saved locally.")
                 .confirm().ok_text("Search games").cancel_text("Not now").close_button(false)
                 .on_ok(move |_, _, cx| {
                     let _ = owner.update(cx, |this, cx| {

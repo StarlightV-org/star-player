@@ -1177,7 +1177,7 @@ mod tests {
     #[test]
     fn worker_persists_consent_history_and_observes_changes() {
         let temp = tempfile::tempdir().unwrap();
-        let store = temp.path().join(".spacer");
+        let store = temp.path().join(".star-player");
         let root = temp.path().join("Clips");
         fs::create_dir_all(root.join("Game")).unwrap();
         let first = root.join("Game/first.mp4");

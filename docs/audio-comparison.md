@@ -22,7 +22,7 @@ Sources:
 Read-only checks of the currently reported clip and the running players found:
 
 - The source has one AAC-LC audio track, two channels, at 44.1 kHz.
-- Spacer's null-output decoder probe preserved stereo at 44.1 kHz. Its track
+- StarPlayer's null-output decoder probe preserved stereo at 44.1 kHz. Its track
   gain was 1, master volume 100, playback speed 1, and extra audio filters empty.
   This probe does not measure the physical output format or the headset sound.
 - The installed VLC version was 3.0.24. Its saved settings did not enable an EQ,
@@ -53,7 +53,7 @@ the reported difference, and the checks did not find a different Windows device
 or session-volume attenuation. No additional EQ or arbitrary bass boost was
 added in response to this comparison.
 
-Spacer now always uses the embedded decoder's OpenAL output with stereo
+StarPlayer now always uses the embedded decoder's OpenAL output with stereo
 channels, as requested. The mixer no longer offers an output-mode selection.
 It does not install a decoder, add an EQ or change G HUB settings. This is not
 an implementation of Logitech DTS. Backend switching remains available only
@@ -63,10 +63,10 @@ WASAPI stereo at 48 kHz and OpenAL stereo reported at 44.1 kHz, preserving mute.
 OpenAL's reported input format does not prove its internal device format or that
 the headset applies the desired effects. Listening confirmation is required.
 
-Restore the desired G HUB effects and compare Spacer with VLC using the same
+Restore the desired G HUB effects and compare StarPlayer with VLC using the same
 clip. If it does not restore the desired sound,
 the next useful comparison is VLC's
-Messages window at verbosity 2, alongside Spacer's terminal diagnostics, with
+Messages window at verbosity 2, alongside StarPlayer's terminal diagnostics, with
 both applications using the same track, position and nominal volume. Compare
 the chosen output module, submitted channel layout, sample format and rate,
 resampling and enabled filters. Headset-driver processing can also be
@@ -79,8 +79,8 @@ It opens a caller-supplied file with null audio output and writes a JSON report.
 Use explicit local paths in PowerShell:
 
 ```powershell
-$env:SPACER_AUDIO_PROBE = 'C:\Videos\example.mp4'
-$env:SPACER_AUDIO_PROBE_OUTPUT = "$env:USERPROFILE\.spacer\audio-probe.json"
+$env:STAR_PLAYER_AUDIO_PROBE = 'C:\Videos\example.mp4'
+$env:STAR_PLAYER_AUDIO_PROBE_OUTPUT = "$env:USERPROFILE\.star-player\audio-probe.json"
 cargo test diagnose_audio_file -- --ignored
 ```
 

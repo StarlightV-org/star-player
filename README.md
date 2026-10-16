@@ -1,4 +1,4 @@
-# Spacer
+# StarPlayer
 
 A Windows x86_64 Rust/GPUI media player with embedded libmpv GPU output.
 
@@ -6,10 +6,10 @@ A Windows x86_64 Rust/GPUI media player with embedded libmpv GPU output.
 
 The Windows x86_64 executable includes the decoder. Users do not need to install mpv, ffmpeg, codec packs, or decoder DLLs. Playback and hover thumbnails both use the embedded library. No external decoder executables are launched and no decoder libraries are searched for on `PATH`.
 
-On first launch, Spacer creates a directory in the user's home:
+On first launch, StarPlayer creates a directory in the user's home:
 
 ```text
-~/.spacer/
+~/.star-player/
   runtime/
     <bundle-id>/
       libmpv-2.dll
@@ -17,7 +17,9 @@ On first launch, Spacer creates a directory in the user's home:
         THIRD_PARTY_NOTICES.md
 ```
 
-On Windows this is normally `%USERPROFILE%\.spacer`. The cache is persistent and versioned. Extraction publishes a complete bundle atomically, and cached resources are checksum-verified before first use in each process. Windows loads the decoder from that absolute path, with dependency searches limited to its directory and Windows System32. A modified or damaged cache produces an error; remove that bundle directory and restart to restore it from the EXE.
+On Windows this is normally `%USERPROFILE%\.star-player`. Before opening settings or the decoder cache, StarPlayer renames an existing `%USERPROFILE%\.spacer` directory to `.star-player`, preserving its contents. Close Spacer before upgrading. If both directories exist, StarPlayer uses `.star-player` and leaves `.spacer` untouched, without merging. A failed migration stops startup and reports an error instead of starting with empty settings.
+
+The cache is persistent and versioned. Extraction publishes a complete bundle atomically, and cached resources are checksum-verified before first use in each process. Windows loads the decoder from that absolute path, with dependency searches limited to its directory and Windows System32. A modified or damaged cache produces an error; remove that bundle directory and restart to restore it from the EXE.
 
 The finished app needs no network connection for local playback or previews. It still uses normal Windows APIs, system drivers, and a writable home directory. The embedded package currently supports Windows x86_64 only.
 
@@ -25,7 +27,7 @@ The finished app needs no network connection for local playback or previews. It 
 
 Install Rust and the native build prerequisites for GPUI. A clean build downloads the pinned decoder archive, about 32 MB, from GitHub and verifies its SHA-256 before extraction. The build compresses runtime resources with Zstandard before embedding them in the EXE. This is a build-time download only.
 
-On first use, Spacer streams decompressed resources into the runtime cache and verifies their original size and SHA-256 before publishing the bundle. Later launches reuse the verified cache without decompression. The loaded decoder is byte-for-byte identical to the upstream DLL, so compression does not change playback or hardware acceleration. Existing valid caches remain compatible. The extracted decoder's disk size is unchanged.
+On first use, StarPlayer streams decompressed resources into the runtime cache and verifies their original size and SHA-256 before publishing the bundle. Later launches reuse the verified cache without decompression. The loaded decoder is byte-for-byte identical to the upstream DLL, so compression does not change playback or hardware acceleration. Existing valid caches remain compatible. The extracted decoder's disk size is unchanged.
 
 ```sh
 cargo run
@@ -33,14 +35,14 @@ cargo run -- "C:/Videos/example.mp4"
 cargo build --release
 ```
 
-Ship `target/release/spacer.exe`; no separate decoder files need to accompany it. For builds without network access, supply the same pinned `.7z` archive using the build-time `SPACER_MPV_ARCHIVE` environment variable. It must have the expected checksum. Cargo dependencies must also be available locally.
+Ship `target/release/star-player.exe`; no separate decoder files need to accompany it. For builds without network access, supply the same pinned `.7z` archive using the build-time `STAR_PLAYER_MPV_ARCHIVE` environment variable. It must have the expected checksum. Cargo dependencies must also be available locally.
 
 ## Local game clip library
 
 Launching without a file opens the clip library. On the first such launch,
-Spacer asks whether to allow NVIDIA Overlay folder discovery. If approved,
+StarPlayer asks whether to allow NVIDIA Overlay folder discovery. If approved,
 it next asks whether to search for local Steam games and their icons. Both
-permission choices are saved in `%USERPROFILE%\.spacer\config.json`. Launching with a
+permission choices are saved in `%USERPROFILE%\.star-player\config.json`. Launching with a
 file skips the prompt. The title-bar cog opens **Settings**, where you can
 add or remove library folders, toggle automatic NVIDIA folder discovery, or
 use **Detect now**. Disabling discovery leaves listed folders monitored.
@@ -48,7 +50,7 @@ Removing a folder does not delete its files or watched history. Unavailable
 folders remain listed and resume scanning when their drives reconnect.
 
 Detection reads `%LOCALAPPDATA%\NVIDIA Corporation\NVIDIA Overlay\GallerySettings.json`
-and adds `settings.currentDirectoryV2` to the `clip_directories` array. Spacer
+and adds `settings.currentDirectoryV2` to the `clip_directories` array. StarPlayer
 does not change NVIDIA settings or move recordings. Missing settings or folders
 produce an error and leave manual folder selection available.
 Enabled discovery checks on startup and during periodic reconciliation.
@@ -68,7 +70,7 @@ prevent manual folder setup or custom icons. There is no Steam search button
 in the library. Use **Search now** in Settings to repeat a search. Steam
 permission is saved; if it has not been granted, Search now asks first.
 Turn off **Allow local Steam game searches** to revoke permission without
-removing cached icons. Spacer reads local Steam
+removing cached icons. StarPlayer reads local Steam
 installation metadata, game manifests across Steam libraries, cached artwork,
 and Steam `.url` shortcuts on the desktop and in the Start menu. It makes no
 network requests, launches no games, and never changes Steam files. There are
@@ -93,7 +95,7 @@ previously detected games, even after uninstalling them. Manual overrides
 survive rescans. Restoring clears the override and shows the automatic icon,
 or the normal folder icon if no automatic match exists.
 
-Icons are normalized to PNG and copied into `.spacer/game-icons/images`.
+Icons are normalized to PNG and copied into `.star-player/game-icons/images`.
 Steam ICO files containing RGB or indexed PNG frames are converted to RGBA.
 `catalog.json` stores discovered Steam games and `folders.json` stores folder
 assignments by absolute path. These icons do not count toward the thumbnail
@@ -106,7 +108,7 @@ Directories are watched recursively. A startup scan and periodic reconciliation
 also catch offline changes and reconnected drives. Directory links are not followed.
 Only recognized video extensions are listed; screenshots and audio-only files
 remain accessible through **Open file**. Thumbnails use the bundled decoder,
-load on demand, and cache in `.spacer/thumbnails`. The disk cache is limited to
+load on demand, and cache in `.star-player/thumbnails`. The disk cache is limited to
 2,000,000 bytes. Startup and new writes remove the oldest generated thumbnails
 first; evicted thumbnails are regenerated when needed.
 
@@ -125,7 +127,7 @@ Previous/Next. Their queue contains videos in the same directory, sorted by
 filename, without scanning subdirectories or adding the directory to the library.
 Each edge button appears only when the cursor is near it and a destination exists.
 
-Playback beginning marks a clip watched. `.spacer/watched.csv` contains
+Playback beginning marks a clip watched. `.star-player/watched.csv` contains
 `sha256,identity_version,watched_at,track_gains` records with UTC watched timestamps
 and a JSON map of audio-track IDs to gains. An empty timestamp means unwatched,
 without discarding saved audio settings. SHA-256 identity combines the immediate
@@ -160,10 +162,10 @@ Press Enter in the rename field to save, or Escape to cancel.
 Bulk **Delete** and the Delete key ask for confirmation before moving clips to
 the Windows Recycle Bin. Failures are reported without permanently deleting files.
 Configuration and history updates use atomic replacement; malformed existing
-files are reported and not overwritten. Running multiple Spacer instances that
+files are reported and not overwritten. Running multiple StarPlayer instances that
 edit the same configuration/history simultaneously is not supported.
 
-The Windows title bar is drawn by GPUI Kit with the Spacer icon/name and window
+The Windows title bar is drawn by GPUI Kit with the StarPlayer icon/name and window
 controls. It is hidden in fullscreen; native video occupies the space below it.
 The player's Library and Open file buttons are at the upper left. The info button
 shows a concise file summary, video codec/resolution/frame rate, audio/subtitle
@@ -239,7 +241,7 @@ history. These buttons do not seek or step through the folder's video list.
 
 Hover over the timeline for a thumbnail and its requested timestamp. Click or drag to seek. A separate, silent decoder handles previews without changing playback position. Requests are debounced and superseded requests are canceled. Audio-only files have no thumbnail.
 
-On Windows, media play/pause, stop, previous, and next keys work while Spacer is the foreground application. Previous/next media keys seek by 10 seconds. Windows system volume keys keep their normal behavior. Background media-session integration is not implemented.
+On Windows, media play/pause, stop, previous, and next keys work while StarPlayer is the foreground application. Previous/next media keys seek by 10 seconds. Windows system volume keys keep their normal behavior. Background media-session integration is not implemented.
 
 Frame stepping uses mpv's frame commands rather than an assumed frame rate. Backward stepping can be slower because the decoder must seek and reconstruct preceding frames.
 
@@ -249,16 +251,19 @@ gains remain unchanged.
 
 ## Themes
 
-Spacer keeps the original dark plum and rose palette by default. On launch it
-creates `~/.spacer/themes/spacer-original.json` if missing, without overwriting
-existing edits. The default file uses hex colors. The old `~/.spacer/theme.json`
+StarPlayer keeps the original dark plum and rose palette by default. On launch it
+creates `~/.star-player/themes/star-player-original.json` if missing, without overwriting
+existing edits. The legacy `spacer-original.json` is renamed when the new file does
+not exist, preserving custom colors and updating its default display name and
+saved selection. If both theme files exist, neither is overwritten. The default
+file uses hex colors. The old `~/.star-player/theme.json`
 is left untouched and is no longer loaded.
 
 Choose a theme in Settings > Theme to apply it immediately. The selector shows
-each file's `name` field. Spacer remembers the selection in `appearance.json`.
+each file's `name` field. StarPlayer remembers the selection in `appearance.json`.
 The themes folder is watched for additions, deletions, renames and content edits,
 including editors that replace a file on save. Changes to the active theme apply
-automatically. If it disappears, Spacer switches to Spacer original.
+automatically. If it disappears, StarPlayer switches to StarPlayer original.
 
 Create new theme copies the active theme to `custom.json`, then `custom-2.json`,
 and so on, and selects the copy. The theme table has per-file Use, Rename and
@@ -312,12 +317,12 @@ More specific contexts take precedence; user bindings win ties with defaults.
 The editor warns about overlapping shortcuts and sequence prefixes.
 
 Only user additions, overrides and explicit removals are saved in
-`~/.spacer/keybinds.json`. Defaults remain in the application. Removing a default
+`~/.star-player/keybinds.json`. Defaults remain in the application. Removing a default
 stores a disabled entry so it stays removed after restarting. Reset action
 removes that action's changes; Reset all leaves an empty list. The shortcut-help
 panel also reflects the effective bindings. There is no JSON editor in settings.
 Malformed keymap files are reported and left unchanged. Repair the file and
-restart Spacer before saving further changes.
+restart StarPlayer before saving further changes.
 
 ## Headset audio routing
 

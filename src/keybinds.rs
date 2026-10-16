@@ -530,7 +530,7 @@ impl Keymap {
     }
     fn commit(&mut self, changes: Vec<Binding>) -> Result<(), String> {
         if self.error.is_some() {
-            return Err("Repair keybinds.json and restart Spacer before saving. The invalid file was left unchanged.".into());
+            return Err("Repair keybinds.json and restart StarPlayer before saving. The invalid file was left unchanged.".into());
         }
         fs::create_dir_all(self.path.parent().ok_or("Missing keymap directory")?)
             .map_err(|e| e.to_string())?;

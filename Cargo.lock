@@ -6404,34 +6404,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spacer"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "csv",
- "dirs 6.0.0",
- "gpui-kit",
- "gpui-pre",
- "gpui-pre-platform",
- "image",
- "libloading",
- "notify",
- "raw-window-handle",
- "reqwest",
- "rfd",
- "serde",
- "serde_json",
- "sevenz-rust2",
- "sha2 0.10.9",
- "smallvec",
- "tempfile",
- "trash",
- "windows-sys 0.61.2",
- "winresource",
- "zstd",
-]
-
-[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6463,6 +6435,34 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "star-player"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "csv",
+ "dirs 6.0.0",
+ "gpui-kit",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "image",
+ "libloading",
+ "notify",
+ "raw-window-handle",
+ "reqwest",
+ "rfd",
+ "serde",
+ "serde_json",
+ "sevenz-rust2",
+ "sha2 0.10.9",
+ "smallvec",
+ "tempfile",
+ "trash",
+ "windows-sys 0.61.2",
+ "winresource",
+ "zstd",
+]
 
 [[package]]
 name = "static_assertions"

@@ -103,9 +103,34 @@ impl Default for Config {
 }
 
 pub fn directory() -> Result<PathBuf, String> {
-    dirs::home_dir()
-        .map(|p| p.join(".spacer"))
-        .ok_or_else(|| "Cannot locate your home directory".into())
+    let home = dirs::home_dir().ok_or("Cannot locate your home directory")?;
+    directory_in(&home)
+}
+
+fn directory_in(home: &Path) -> Result<PathBuf, String> {
+    // Serialize migration within the process, including decoder initialization.
+    static MIGRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = MIGRATION.lock().map_err(|_| "Data migration lock failed")?;
+    let old = home.join(".spacer");
+    let new = home.join(".star-player");
+    let prepare = || -> std::io::Result<()> {
+        if !new.try_exists()? && old.try_exists()? {
+            if !old.is_dir() {
+                return Err(std::io::Error::other(
+                    "The legacy data path is not a directory",
+                ));
+            }
+            fs::rename(&old, &new)?;
+        }
+        fs::create_dir_all(&new)
+    };
+    prepare().map_err(|error| {
+        format!(
+            "Cannot prepare StarPlayer data at {}: {error}. Existing data was not deleted; close any running Spacer instances and check folder permissions before retrying",
+            new.display()
+        )
+    })?;
+    Ok(new)
 }
 
 /// Hide Windows' extended-path syntax in UI only. Never use this for file I/O.
@@ -389,6 +414,86 @@ pub fn validate_gains(gains: &BTreeMap<i64, f64>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_all_legacy_data_and_reuses_destination() {
+        let home = tempfile::tempdir().unwrap();
+        let old = home.path().join(".spacer");
+        for relative in [
+            "config.json",
+            "watched.csv",
+            "keybinds.json",
+            "appearance.json",
+            "themes/custom.json",
+            "runtime/bundle/decoder.dll",
+            "thumbnails/clip.png",
+            "game-icons/images/game.png",
+        ] {
+            let path = old.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, relative).unwrap();
+        }
+        let new = directory_in(home.path()).unwrap();
+        assert_eq!(new, home.path().join(".star-player"));
+        assert!(!old.exists());
+        for relative in [
+            "config.json",
+            "watched.csv",
+            "keybinds.json",
+            "appearance.json",
+            "themes/custom.json",
+            "runtime/bundle/decoder.dll",
+            "thumbnails/clip.png",
+            "game-icons/images/game.png",
+        ] {
+            assert_eq!(fs::read_to_string(new.join(relative)).unwrap(), relative);
+        }
+        assert_eq!(directory_in(home.path()).unwrap(), new);
+    }
+
+    #[test]
+    fn existing_destination_wins_without_merging() {
+        let home = tempfile::tempdir().unwrap();
+        let old = home.path().join(".spacer");
+        let new = home.path().join(".star-player");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("config.json"), "old").unwrap();
+        fs::write(new.join("config.json"), "new").unwrap();
+        assert_eq!(directory_in(home.path()).unwrap(), new);
+        assert_eq!(fs::read_to_string(old.join("config.json")).unwrap(), "old");
+        assert_eq!(fs::read_to_string(new.join("config.json")).unwrap(), "new");
+    }
+
+    #[test]
+    fn creates_a_fresh_data_directory() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(directory_in(home.path()).unwrap().is_dir());
+        assert!(!home.path().join(".spacer").exists());
+    }
+
+    #[test]
+    fn migration_failure_does_not_start_fresh() {
+        let home = tempfile::tempdir().unwrap();
+        let old = home.path().join(".spacer");
+        fs::write(&old, "preserve me").unwrap();
+        assert!(directory_in(home.path()).is_err());
+        assert_eq!(fs::read_to_string(old).unwrap(), "preserve me");
+        assert!(!home.path().join(".star-player").exists());
+    }
+
+    #[test]
+    fn blocked_destination_preserves_legacy_data() {
+        let home = tempfile::tempdir().unwrap();
+        let old = home.path().join(".spacer");
+        let new = home.path().join(".star-player");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("config.json"), "old").unwrap();
+        fs::write(&new, "blocked").unwrap();
+        assert!(directory_in(home.path()).is_err());
+        assert_eq!(fs::read_to_string(old.join("config.json")).unwrap(), "old");
+        assert_eq!(fs::read_to_string(new).unwrap(), "blocked");
+    }
     #[test]
     fn display_paths_hide_extended_drive_and_unc_prefixes_only() {
         assert_eq!(

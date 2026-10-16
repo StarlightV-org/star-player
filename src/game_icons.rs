@@ -784,7 +784,7 @@ mod tests {
     fn custom_executable_icon_is_extracted_and_persists_without_the_executable() {
         let temp = tempfile::tempdir().unwrap();
         let system = std::env::current_exe().unwrap();
-        // The test executable includes Spacer's embedded application icon.
+        // The test executable includes StarPlayer's embedded application icon.
         // ExtractIconEx reads its resources; no process is started.
         let exe = temp.path().join("selected.EXE");
         fs::copy(system, &exe).unwrap();

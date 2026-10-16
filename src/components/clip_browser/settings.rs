@@ -593,7 +593,7 @@ impl ClipBrowser {
                 .child(
                     div()
                         .text_lg()
-                        .child(format!("Spacer {}", env!("CARGO_PKG_VERSION"))),
+                        .child(format!("StarPlayer {}", env!("CARGO_PKG_VERSION"))),
                 )
                 .child("Video playback powered by embedded libmpv.")
                 .child("Built with GPUI and GPUI Kit.")
@@ -1726,7 +1726,7 @@ mod tests {
                         }).map_err(|e| e.to_string())??;
                         cx.background_executor().timer(std::time::Duration::from_millis(600)).await;
                         cx.update_window(handle.into(),|_,_,cx| {
-                            if cx.global::<ThemeLibrary>().active!="spacer-original.json" || cx.theme().primary!=Hsla::from(rgb(0xa50036)) { return Err("Deleting the active theme did not restore Spacer original".to_owned()); }
+                            if cx.global::<ThemeLibrary>().active!="star-player-original.json" || cx.theme().primary!=Hsla::from(rgb(0xa50036)) { return Err("Deleting the active theme did not restore StarPlayer original".to_owned()); }
                             Ok(())
                         }).map_err(|e| e.to_string())??;
                         cx.background_executor()

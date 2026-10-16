@@ -87,7 +87,7 @@ mod platform {
     impl NativeBackdrop {
         pub fn new(parent: HWND) -> Result<Self, String> {
             static CLASS: OnceLock<Result<u16, String>> = OnceLock::new();
-            let class: Vec<u16> = "SpacerOpaqueBackdrop\0".encode_utf16().collect();
+            let class: Vec<u16> = "StarPlayerOpaqueBackdrop\0".encode_utf16().collect();
             CLASS
                 .get_or_init(|| {
                     let class_def = WNDCLASSW {
@@ -171,7 +171,7 @@ mod platform {
         }
 
         pub fn create_video_host(&self) -> Result<HWND, String> {
-            let class: Vec<u16> = "SpacerOpaqueBackdrop\0".encode_utf16().collect();
+            let class: Vec<u16> = "StarPlayerOpaqueBackdrop\0".encode_utf16().collect();
             let hwnd = unsafe {
                 CreateWindowExW(
                     0,

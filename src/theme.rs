@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const ORIGINAL: &str = "spacer-original.json";
+const ORIGINAL: &str = "star-player-original.json";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThemeEntry {
@@ -38,6 +38,7 @@ impl gpui_kit::Global for ThemeLibrary {}
 impl ThemeLibrary {
     pub fn open(directory: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        migrate_original(&directory)?;
         create_default(&directory.join(ORIGINAL))?;
         let active = fs::read(directory.join("../appearance.json"))
             .ok()
@@ -545,6 +546,45 @@ fn read_theme(path: &Path) -> Result<String, String> {
     Ok(source)
 }
 
+fn migrate_original(directory: &Path) -> Result<(), String> {
+    let old = directory.join("spacer-original.json");
+    let new = directory.join(ORIGINAL);
+    let migrate = || -> Result<(), String> {
+        if old.try_exists().map_err(|e| e.to_string())?
+            && !new.try_exists().map_err(|e| e.to_string())?
+        {
+            let bytes = fs::read(&old).map_err(|e| e.to_string())?;
+            // Keep custom colors, extra fields, and invalid files intact.
+            if let Ok(mut document) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && document["name"] == "Spacer original"
+            {
+                document["name"] = "StarPlayer original".into();
+                atomic_json(&old, &document, false)?;
+            }
+            fs::rename(&old, &new).map_err(|e| e.to_string())?;
+        }
+        if !old.try_exists().map_err(|e| e.to_string())?
+            && new.try_exists().map_err(|e| e.to_string())?
+        {
+            let appearance = directory.join("../appearance.json");
+            match fs::read(&appearance) {
+                Ok(bytes) => {
+                    if let Ok(mut document) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        && document["theme"] == "spacer-original.json"
+                    {
+                        document["theme"] = ORIGINAL.into();
+                        atomic_json(&appearance, &document, false)?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
+    };
+    migrate().map_err(|error| format!("Cannot migrate the original theme: {error}"))
+}
+
 fn create_default(path: &Path) -> Result<(), String> {
     if path.exists() {
         return Ok(());
@@ -647,6 +687,106 @@ fn color(value: &serde_json::Value) -> Result<Hsla, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_original_theme_preserving_edits_and_selection() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".spacer");
+        let themes = root.join("themes");
+        fs::create_dir_all(&themes).unwrap();
+        let mut document: serde_json::Value = serde_json::from_str(DEFAULT_THEME).unwrap();
+        document["name"] = "Spacer original".into();
+        document["colors"]["primary"] = "#123456".into();
+        document["extra"] = "preserve".into();
+        atomic_json(&themes.join("spacer-original.json"), &document, true).unwrap();
+        atomic_json(
+            &root.join("appearance.json"),
+            &serde_json::json!({"theme": "spacer-original.json", "extra": 42}),
+            true,
+        )
+        .unwrap();
+        fs::rename(&root, home.path().join(".star-player")).unwrap();
+        let root = home.path().join(".star-player");
+        let themes = root.join("themes");
+        let library = ThemeLibrary::open(themes.clone()).unwrap();
+        assert_eq!(library.active, ORIGINAL);
+        assert!(!themes.join("spacer-original.json").exists());
+        document["name"] = "StarPlayer original".into();
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(themes.join(ORIGINAL)).unwrap()).unwrap();
+        assert_eq!(migrated, document);
+        let appearance: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("appearance.json")).unwrap()).unwrap();
+        assert_eq!(
+            appearance,
+            serde_json::json!({"theme": ORIGINAL, "extra": 42})
+        );
+        drop(library);
+        let before = fs::read(themes.join(ORIGINAL)).unwrap();
+        assert_eq!(ThemeLibrary::open(themes.clone()).unwrap().active, ORIGINAL);
+        assert_eq!(fs::read(themes.join(ORIGINAL)).unwrap(), before);
+    }
+
+    #[test]
+    fn theme_migration_does_not_overwrite_existing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let themes = root.path().join("themes");
+        fs::create_dir_all(&themes).unwrap();
+        let legacy = DEFAULT_THEME.replace("StarPlayer original", "Spacer original");
+        fs::write(themes.join("spacer-original.json"), &legacy).unwrap();
+        fs::write(themes.join(ORIGINAL), DEFAULT_THEME).unwrap();
+        let selection = r#"{"theme":"spacer-original.json"}"#;
+        fs::write(root.path().join("appearance.json"), selection).unwrap();
+        let library = ThemeLibrary::open(themes.clone()).unwrap();
+        assert_eq!(library.active, "spacer-original.json");
+        assert_eq!(
+            fs::read_to_string(themes.join("spacer-original.json")).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            fs::read_to_string(themes.join(ORIGINAL)).unwrap(),
+            DEFAULT_THEME
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("appearance.json")).unwrap(),
+            selection
+        );
+    }
+
+    #[test]
+    fn theme_migration_preserves_invalid_files() {
+        let root = tempfile::tempdir().unwrap();
+        let themes = root.path().join("themes");
+        fs::create_dir_all(&themes).unwrap();
+        fs::write(themes.join("spacer-original.json"), "{unfinished").unwrap();
+        fs::write(root.path().join("appearance.json"), "{invalid").unwrap();
+        ThemeLibrary::open(themes.clone()).unwrap();
+        assert_eq!(
+            fs::read_to_string(themes.join(ORIGINAL)).unwrap(),
+            "{unfinished"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("appearance.json")).unwrap(),
+            "{invalid"
+        );
+    }
+
+    #[test]
+    fn theme_migration_preserves_custom_display_names_and_other_selections() {
+        let root = tempfile::tempdir().unwrap();
+        let themes = root.path().join("themes");
+        fs::create_dir_all(&themes).unwrap();
+        let custom = DEFAULT_THEME.replace("StarPlayer original", "My edited palette");
+        fs::write(themes.join("spacer-original.json"), &custom).unwrap();
+        let selection = r#"{"theme":"custom.json"}"#;
+        fs::write(root.path().join("appearance.json"), selection).unwrap();
+        migrate_original(&themes).unwrap();
+        assert_eq!(fs::read_to_string(themes.join(ORIGINAL)).unwrap(), custom);
+        assert_eq!(
+            fs::read_to_string(root.path().join("appearance.json")).unwrap(),
+            selection
+        );
+    }
     #[test]
     fn renaming_an_inactive_theme_does_not_change_the_selection() {
         let dir = tempfile::tempdir().unwrap();
@@ -660,7 +800,7 @@ mod tests {
         assert!(library.directory.join("other-theme.json").exists());
         assert!(
             library
-                .rename_file("other-theme.json", "Spacer original")
+                .rename_file("other-theme.json", "StarPlayer original")
                 .is_err()
         );
         assert!(
@@ -675,14 +815,14 @@ mod tests {
         let folder = dir.path().join("themes");
         let mut library = ThemeLibrary::open(folder.clone()).unwrap();
         library.reload_active().unwrap();
-        assert_eq!(library.entries[0].name, "Spacer original");
+        assert_eq!(library.entries[0].name, "StarPlayer original");
         library.create().unwrap();
         assert_eq!(library.active, "custom.json");
         library.reload_active().unwrap();
         library.create().unwrap();
         assert_eq!(library.active, "custom-2.json");
         assert!(library.rename("CUSTOM").is_err());
-        assert!(library.rename("Spacer Original").is_err());
+        assert!(library.rename("StarPlayer Original").is_err());
         library.rename("Midnight Rose").unwrap();
         assert_eq!(library.active, "midnight-rose.json");
         assert!(!folder.join("custom-2.json").exists());
@@ -745,7 +885,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut library = ThemeLibrary::open(dir.path().join("themes")).unwrap();
         let path = library.directory.join(ORIGINAL);
-        let source = DEFAULT_THEME.replace("Spacer original", "Edited externally");
+        let source = DEFAULT_THEME.replace("StarPlayer original", "Edited externally");
         atomic_json(
             &path,
             &serde_json::from_str::<serde_json::Value>(&source).unwrap(),

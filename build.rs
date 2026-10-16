@@ -16,12 +16,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=licenses/THIRD_PARTY_NOTICES.md");
-    println!("cargo:rerun-if-env-changed=SPACER_MPV_ARCHIVE");
+    println!("cargo:rerun-if-env-changed=STAR_PLAYER_MPV_ARCHIVE");
     if let Err(error) = bundle() {
-        panic!("Unable to embed Spacer's decoder: {error}");
+        panic!("Unable to embed StarPlayer's decoder: {error}");
     }
     if let Err(error) = embed_icon() {
-        panic!("Unable to embed Spacer's icon: {error}");
+        panic!("Unable to embed StarPlayer's icon: {error}");
     }
 }
 
@@ -56,9 +56,13 @@ fn embed_icon() -> Result<(), Box<dyn Error>> {
         icon.extend_from_slice(&bytes);
     }
     let path =
-        PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is missing")?).join("spacer.ico");
+        PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is missing")?).join("star-player.ico");
     fs::write(&path, icon)?;
     winresource::WindowsResource::new()
+        .set("ProductName", "StarPlayer")
+        .set("FileDescription", "StarPlayer")
+        .set("InternalName", "star-player")
+        .set("OriginalFilename", "star-player.exe")
         .set_icon(path.to_str().ok_or("non-UTF8 icon path")?)
         .compile()?;
     Ok(())
@@ -71,7 +75,7 @@ fn bundle() -> Result<(), Box<dyn Error>> {
     {
         return Err("the self-contained decoder currently supports Windows x86_64 only".into());
     }
-    let archive = if let Some(path) = env::var_os("SPACER_MPV_ARCHIVE") {
+    let archive = if let Some(path) = env::var_os("STAR_PLAYER_MPV_ARCHIVE") {
         let path = PathBuf::from(path);
         println!("cargo:rerun-if-changed={}", path.display());
         path
@@ -84,7 +88,7 @@ fn bundle() -> Result<(), Box<dyn Error>> {
     };
     let digest = file_digest(&archive)?;
     if digest != ARCHIVE_SHA256 {
-        return Err(format!("decoder archive checksum mismatch: expected {ARCHIVE_SHA256}, got {digest}. Remove {} and rebuild, or supply the pinned archive with SPACER_MPV_ARCHIVE", archive.display()).into());
+        return Err(format!("decoder archive checksum mismatch: expected {ARCHIVE_SHA256}, got {digest}. Remove {} and rebuild, or supply the pinned archive with STAR_PLAYER_MPV_ARCHIVE", archive.display()).into());
     }
     let extracted = output.join("decoder-files");
     if extracted.exists() {
