@@ -122,7 +122,7 @@ pub fn actions() -> Vec<Action> {
         ("previous_clip", "Previous clip", "Player", ""),
         ("next_clip", "Next clip", "Player", ""),
         ("info", "Toggle file information", "Player", ""),
-        ("tracks", "Toggle audio mixer", "Player", ""),
+        ("tracks", "Toggle file settings", "Player", ""),
         ("add_folder", "Add library folder", "ClipLibrary", ""),
         ("detect", "Detect NVIDIA folder", "ClipLibrary", ""),
         ("steam_search", "Search Steam games", "ClipLibrary", ""),

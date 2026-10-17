@@ -93,6 +93,7 @@ pub struct ClipBrowser {
     history_ready: bool,
     audio_overrides: HashMap<String, std::collections::BTreeMap<i64, f64>>,
     resume_overrides: HashMap<String, Option<f64>>,
+    file_overrides: HashMap<String, crate::chapters::FileSettings>,
     pub settings: bool,
     rename_subscription: Option<Subscription>,
     settings_state: Option<settings::SettingsState>,
@@ -170,6 +171,7 @@ impl ClipBrowser {
             history_ready: false,
             audio_overrides: HashMap::new(),
             resume_overrides: HashMap::new(),
+            file_overrides: HashMap::new(),
             settings: false,
             rename_subscription: None,
             settings_state: None,
@@ -271,6 +273,11 @@ impl ClipBrowser {
                     self.rebuild();
                 }
                 Event::History(history) => {
+                    self.file_overrides.retain(|key, settings| {
+                        history
+                            .get(key)
+                            .is_none_or(|state| &state.file_settings != settings)
+                    });
                     self.resume_overrides.retain(|key, position| {
                         !history
                             .get(key)
@@ -283,6 +290,14 @@ impl ClipBrowser {
                     });
                     self.history = history;
                     self.history_ready = true;
+                }
+                Event::FileSettingsFailed(path, attempted, error) => {
+                    if let Ok(key) = crate::clip_store::hash_filename(&path)
+                        && self.file_overrides.get(&key) == Some(&attempted)
+                    {
+                        self.file_overrides.remove(&key);
+                    }
+                    cx.emit(BrowserEvent::Error(error));
                 }
                 Event::Renamed(old, new) => {
                     let mut view = self.view();
@@ -300,7 +315,10 @@ impl ClipBrowser {
                             self.audio_overrides.insert(new_hash.clone(), gains);
                         }
                         if let Some(position) = self.resume_overrides.remove(&old_hash) {
-                            self.resume_overrides.insert(new_hash, position);
+                            self.resume_overrides.insert(new_hash.clone(), position);
+                        }
+                        if let Some(settings) = self.file_overrides.remove(&old_hash) {
+                            self.file_overrides.insert(new_hash, settings);
                         }
                     }
                     for clip in &mut self.catalog.clips {
@@ -516,6 +534,12 @@ impl ClipBrowser {
     }
     pub fn media_state(&self, path: &Path) -> crate::clip_store::MediaState {
         let mut state = crate::clip_store::media_state(&self.history, path);
+        if let Some(settings) = crate::clip_store::hash_filename(path)
+            .ok()
+            .and_then(|key| self.file_overrides.get(&key))
+        {
+            state.file_settings = settings.clone();
+        }
         if let Some(position) = crate::clip_store::hash_filename(path)
             .ok()
             .and_then(|key| self.resume_overrides.get(&key))
@@ -540,6 +564,12 @@ impl ClipBrowser {
             }
         }
         self.worker.send(Request::Audio(path, gains));
+    }
+    pub fn save_file_settings(&mut self, path: PathBuf, settings: crate::chapters::FileSettings) {
+        if let Ok(hash) = crate::clip_store::hash_filename(&path) {
+            self.file_overrides.insert(hash, settings.clone());
+        }
+        self.worker.send(Request::FileSettings(path, settings));
     }
     pub fn save_resume(&mut self, path: PathBuf, position: Option<f64>) {
         if let Ok(hash) = crate::clip_store::hash_filename(&path) {

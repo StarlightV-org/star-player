@@ -146,6 +146,7 @@ pub enum Request {
     Watched(Vec<PathBuf>, bool, String),
     Delete(Vec<PathBuf>, Arc<AtomicBool>),
     Audio(PathBuf, BTreeMap<i64, f64>),
+    FileSettings(PathBuf, crate::chapters::FileSettings),
     Resume(PathBuf, Option<f64>),
     Master(f64, bool),
     Rename(PathBuf, String, Arc<AtomicBool>),
@@ -161,6 +162,7 @@ pub enum Event {
     Error(String),
     Renamed(PathBuf, PathBuf),
     RenameFailed(PathBuf, String),
+    FileSettingsFailed(PathBuf, crate::chapters::FileSettings, String),
 }
 
 pub struct LibraryWorker {
@@ -293,7 +295,7 @@ fn run(
                     let result = (|| {
                         if !history_valid {
                             return Err(
-                                "Repair watched.csv before saving playback positions".into()
+                                "Repair media history before saving playback positions".into()
                             );
                         }
                         clip_store::validate_resume_position(position)?;
@@ -314,10 +316,34 @@ fn run(
                         }
                     }
                 }
+                Request::FileSettings(path, settings) => {
+                    let attempted = settings.clone();
+                    let result = (|| {
+                        if !history_valid {
+                            return Err("Repair media history before saving file settings".into());
+                        }
+                        settings.validate()?;
+                        let mut next = history.clone();
+                        let mut state = clip_store::media_state(&next, &path);
+                        state.file_settings = settings;
+                        next.insert(clip_store::hash_filename(&path)?, state);
+                        clip_store::save_history(dir, &next)?;
+                        history = next;
+                        Ok::<_, String>(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            let _ = events.send(Event::History(history.clone()));
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::FileSettingsFailed(path, attempted, e));
+                        }
+                    }
+                }
                 Request::Audio(path, gains) => {
                     let result = (|| {
                         if !history_valid {
-                            return Err("Repair watched.csv before saving audio settings".into());
+                            return Err("Repair media history before saving audio settings".into());
                         }
                         clip_store::validate_gains(&gains)?;
                         let mut next = history.clone();
@@ -370,7 +396,7 @@ fn run(
                         ))
                     } else if !history_valid {
                         Err(RenameFailure::from(
-                            "Repair watched.csv before renaming files",
+                            "Repair media history before renaming files",
                         ))
                     } else {
                         rename_clip(dir, &path, &stem, &catalog, &mut history)
@@ -683,7 +709,7 @@ fn run(
                 Request::Watched(paths, value, timestamp) => {
                     if !history_valid {
                         let _ = events.send(Event::Error(
-                            "Repair watched.csv before saving watched status".into(),
+                            "Repair media history before saving watched status".into(),
                         ));
                         let _ = events.send(Event::WatchedComplete(paths));
                         continue;
@@ -935,6 +961,60 @@ fn rename_clip(
 mod tests {
     use super::*;
     #[test]
+    fn file_settings_worker_preserves_audio_and_resume_and_rejects_broken_database() {
+        let store = tempfile::tempdir().unwrap();
+        let path = store.path().join("clip.mp4");
+        let mut state = clip_store::MediaState {
+            identity_version: 2,
+            resume_position: Some(42.0),
+            track_gains: BTreeMap::from([(1, 0.4)]),
+            ..Default::default()
+        };
+        let key = clip_store::hash_filename(&path).unwrap();
+        clip_store::save_history(store.path(), &History::from([(key.clone(), state.clone())]))
+            .unwrap();
+        let settings = crate::chapters::FileSettings {
+            chapters: crate::chapters::import("0:10 Chapter", 60.0, &[]).points,
+            embedded_disabled: true,
+            ..Default::default()
+        };
+        let worker = LibraryWorker::for_test(store.path().to_owned());
+        worker.send(Request::FileSettings(path.clone(), settings.clone()));
+        loop {
+            match worker.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::History(history)
+                    if history
+                        .get(&key)
+                        .is_some_and(|s| s.file_settings == settings) =>
+                {
+                    break;
+                }
+                Event::FileSettingsFailed(_, _, e) | Event::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        drop(worker);
+        state.file_settings = settings.clone();
+        assert_eq!(clip_store::read_history(store.path()).unwrap()[&key], state);
+        fs::write(store.path().join("library.db"), b"broken").unwrap();
+        let worker = LibraryWorker::for_test(store.path().to_owned());
+        worker.send(Request::FileSettings(path.clone(), settings.clone()));
+        loop {
+            match worker.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::FileSettingsFailed(p, attempted, _) => {
+                    assert_eq!(p, path);
+                    assert_eq!(attempted, settings);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            fs::read(store.path().join("library.db")).unwrap(),
+            b"broken"
+        );
+    }
+    #[test]
     fn steam_permission_ack_follows_saved_config_and_rejects_invalid_config() {
         let store = tempfile::tempdir().unwrap();
         let worker = LibraryWorker::for_test(store.path().to_owned());
@@ -1071,6 +1151,11 @@ mod tests {
             watched_at: "2026-10-14T18:42:00Z".into(),
             track_gains: BTreeMap::from([(1, 0.25), (2, 0.0)]),
             resume_position: Some(345.75),
+            file_settings: crate::chapters::FileSettings {
+                chapters: crate::chapters::import("0:10 Intro", 100.0, &[]).points,
+                embedded_disabled: true,
+                ..Default::default()
+            },
         };
         let old_hash = clip_store::hash_filename(&old).unwrap();
         let mut history = History::from([(old_hash.clone(), state.clone())]);

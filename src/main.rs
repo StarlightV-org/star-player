@@ -3,10 +3,12 @@
 use components::{
     audio_tracks::{AudioTracks, TrackGainEvent},
     clip_browser::{BrowserEvent, BrowserView, ClipBrowser},
+    file_settings::{FileSettingsEvent, FileSettingsPanel},
     media_controls::{MediaControls, MediaControlsEvent},
     seeker_bar::{SeekerBar, SeekerEvent},
     volume_controls::{VolumeControls, VolumeEvent},
 };
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, TITLE_BAR_HEIGHT, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants},
@@ -24,6 +26,7 @@ use std::{
 
 mod app_assets;
 mod app_icon;
+mod chapters;
 mod clip_details;
 mod clip_library;
 mod clip_store;
@@ -144,6 +147,11 @@ struct PlayerShell {
     volume_controls: Entity<VolumeControls>,
     seeker_bar: Entity<SeekerBar>,
     audio_tracks: Entity<AudioTracks>,
+    file_settings: Entity<FileSettingsPanel>,
+    file_settings_trigger_bounds: Rc<Cell<Bounds<Pixels>>>,
+    file_settings_panel_bounds: Rc<Cell<Bounds<Pixels>>>,
+    file_settings_title_bounds: Rc<Cell<Bounds<Pixels>>>,
+    skip_pending: Option<(f64, Instant)>,
     selected_track: usize,
     show_help: bool,
     show_info: bool,
@@ -388,7 +396,18 @@ impl PlayerShell {
         let volume_controls = cx.new(VolumeControls::new);
         let seeker_bar = cx.new(|cx| SeekerBar::new(0.0, cx));
         let audio_tracks = cx.new(AudioTracks::new);
+        let file_settings = cx.new(|cx| FileSettingsPanel::new(audio_tracks.clone(), window, cx));
         let subscriptions = vec![
+            cx.subscribe(&file_settings, |this, _, event, cx| match event {
+                FileSettingsEvent::Save(path, settings) => {
+                    this.browser.update(cx, |browser, _| {
+                        browser.save_file_settings(path.clone(), settings.clone())
+                    });
+                }
+                FileSettingsEvent::Seek(time) => {
+                    this.command(Command::SeekAbsolute(*time), cx);
+                }
+            }),
             cx.subscribe_in(
                 &browser,
                 window,
@@ -625,6 +644,11 @@ impl PlayerShell {
             title_hovered: false,
             title_focus: cx.focus_handle(),
             show_tracks: false,
+            file_settings,
+            file_settings_trigger_bounds: Rc::new(Cell::new(Bounds::default())),
+            file_settings_panel_bounds: Rc::new(Cell::new(Bounds::default())),
+            file_settings_title_bounds: Rc::new(Cell::new(Bounds::default())),
+            skip_pending: None,
             controls_visible: true,
             focus_mode: false,
             controls_opacity: 1.0,
@@ -897,6 +921,7 @@ impl PlayerShell {
         }
         self.error = None;
         self.snapshot = Snapshot::default();
+        self.skip_pending = None;
         self.notified_playback_error = None;
         self.selected_track = 0;
         self.show_tracks = false;
@@ -1084,6 +1109,41 @@ impl PlayerShell {
             });
         }
         self.update_navigation_hover(window, cx);
+        let settings = self
+            .path
+            .as_ref()
+            .map(|path| self.browser.read(cx).media_state(path).file_settings)
+            .unwrap_or_default();
+        let chapters = settings.chapters(&self.snapshot.metadata, self.snapshot.duration);
+        if self.snapshot.path == self.path && self.path.is_some() && !self.snapshot.ended {
+            if let Some(target) =
+                chapters::skip_target(&chapters, self.snapshot.position, self.snapshot.duration)
+            {
+                let waiting = self.skip_pending.is_some_and(|(previous, sent)| {
+                    previous == target && sent.elapsed() < Duration::from_secs(1)
+                });
+                if !waiting {
+                    self.command(Command::SeekAbsolute(target), cx);
+                    self.skip_pending = Some((target, Instant::now()));
+                }
+            } else {
+                self.skip_pending = None;
+            }
+        }
+        self.file_settings.update(cx, |panel, cx| {
+            panel.sync(
+                self.path.clone(),
+                settings.clone(),
+                chapters.clone(),
+                self.snapshot.position,
+                self.snapshot.duration,
+                window,
+                cx,
+            )
+        });
+        self.seeker_bar.update(cx, |seeker, cx| {
+            seeker.set_annotations(chapters, settings.markers, cx)
+        });
         let snapshot = &self.snapshot;
         self.media_controls.update(cx, |controls, cx| {
             controls.set_playing(!snapshot.paused, cx)
@@ -1476,7 +1536,7 @@ impl Render for PlayerShell {
             self.controls_opacity * self.controls_opacity * (3.0 - 2.0 * self.controls_opacity);
         let controls_offset = 8.0 - (1.0 - opacity) * 8.0;
         let info_trigger_bounds = Rc::new(Cell::new(Bounds::default()));
-        let mixer_trigger_bounds = Rc::new(Cell::new(Bounds::default()));
+        let mixer_trigger_bounds = self.file_settings_trigger_bounds.clone();
         let shell = cx.weak_entity();
         // History buttons work over occluding panels and the library as well as
         // the video. Root hitbox handlers alone cannot see all of those clicks.
@@ -1562,48 +1622,84 @@ impl Render for PlayerShell {
                         .child(self.browser.clone()),
                 )
             })
-            .when(self.resume_prompt.is_some() && self.path.is_some() && !self.show_settings && !self.player_focus_mode(), |shell| {
-                let position = self.resume_prompt.as_ref().unwrap().position;
-                let seconds = position.floor() as u64;
-                let timestamp = if seconds >= 3600 {
-                    format!("{}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
-                } else {
-                    format!("{}:{:02}", seconds / 60, seconds % 60)
-                };
-                shell.child(
-                    div().absolute().left_4().right_4()
-                        .bottom(px(if self.controls_visible { 140.0 } else { 24.0 }))
-                        .flex().justify_center()
-                        .child(
-                            div().id("resume-toast").track_focus(&self.resume_focus)
-                                .occlude().flex().items_center().gap_3().px_3().py_2()
-                                .rounded_lg().bg(cx.theme().background.opacity(0.96))
-                                .border_1().border_color(cx.theme().border).shadow_lg()
-                                .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
-                                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                                    if let Some(prompt) = &mut this.resume_prompt {
-                                        prompt.expired(Instant::now(), this.resume_focus.contains_focused(window, cx));
-                                        prompt.hovered = *hovered;
-                                    }
-                                    this.reveal_controls(cx);
-                                }))
-                                .child(format!("Resume from {timestamp}?"))
-                                .child(Button::new("resume-playback").label("Resume")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.resume_prompt = None;
-                                        this.command(Command::SeekAbsolute(position), cx);
-                                        window.focus(&this.focus, cx);
-                                    })))
-                                .child(Button::new("dismiss-resume").ghost().label("×")
-                                    .tooltip("Dismiss resume prompt")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.resume_prompt = None;
-                                        window.focus(&this.focus, cx);
-                                        cx.notify();
-                                    }))),
-                        ),
-                )
-            })
+            .when(
+                self.resume_prompt.is_some()
+                    && self.path.is_some()
+                    && !self.show_settings
+                    && !self.player_focus_mode(),
+                |shell| {
+                    let position = self.resume_prompt.as_ref().unwrap().position;
+                    let seconds = position.floor() as u64;
+                    let timestamp = if seconds >= 3600 {
+                        format!(
+                            "{}:{:02}:{:02}",
+                            seconds / 3600,
+                            seconds / 60 % 60,
+                            seconds % 60
+                        )
+                    } else {
+                        format!("{}:{:02}", seconds / 60, seconds % 60)
+                    };
+                    shell.child(
+                        div()
+                            .absolute()
+                            .left_4()
+                            .right_4()
+                            .bottom(px(if self.controls_visible { 140.0 } else { 24.0 }))
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .id("resume-toast")
+                                    .track_focus(&self.resume_focus)
+                                    .occlude()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .bg(cx.theme().background.opacity(0.96))
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .shadow_lg()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::click_overlay),
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                                        if let Some(prompt) = &mut this.resume_prompt {
+                                            prompt.expired(
+                                                Instant::now(),
+                                                this.resume_focus.contains_focused(window, cx),
+                                            );
+                                            prompt.hovered = *hovered;
+                                        }
+                                        this.reveal_controls(cx);
+                                    }))
+                                    .child(format!("Resume from {timestamp}?"))
+                                    .child(Button::new("resume-playback").label("Resume").on_click(
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.resume_prompt = None;
+                                            this.command(Command::SeekAbsolute(position), cx);
+                                            window.focus(&this.focus, cx);
+                                        }),
+                                    ))
+                                    .child(
+                                        Button::new("dismiss-resume")
+                                            .ghost()
+                                            .label("×")
+                                            .tooltip("Dismiss resume prompt")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.resume_prompt = None;
+                                                window.focus(&this.focus, cx);
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
+            )
             .when(
                 self.controls_opacity > 0.0 && self.path.is_some() && !self.show_settings,
                 |shell| {
@@ -1753,33 +1849,40 @@ impl Render for PlayerShell {
                                                 .child(self.volume_controls.clone())
                                                 .flex_shrink_0(),
                                         )
-                                        .child(div().flex_1().min_w_0().child(self.seeker_bar.clone()))
+                                        .child(
+                                            div().flex_1().min_w_0().child(self.seeker_bar.clone()),
+                                        )
                                         .child(
                                             div()
                                                 .flex()
                                                 .items_center()
                                                 .gap_2()
                                                 .flex_shrink_0()
-                                                .when(
-                                                    !self.snapshot.tracks.is_empty(),
-                                                    |controls| {
-                                                        controls.child(
-                                                            div().relative().child(Button::new("audio-mixer")
-                                                                .ghost()
-                                                                .icon(IconName::Settings2)
-                                                                .tooltip("Audio track mixer")
-                                                                .on_click(cx.listener(
-                                                                    |this, _, _, cx| {
-                                                                        this.show_tracks =
-                                                                            !this.show_tracks;
-                                                                        this.reveal_controls(cx);
-                                                                        cx.notify();
-                                                                    },
-                                                                )))
-                                                                .child(measure_bounds(mixer_trigger_bounds.clone())),
-                                                        )
-                                                    },
-                                                )
+                                                .when(self.path.is_some(), |controls| {
+                                                    controls.child(
+                                                        div()
+                                                            .relative()
+                                                            .child(
+                                                                Button::new("audio-mixer")
+                                                                    .ghost()
+                                                                    .icon(IconName::Settings2)
+                                                                    .tooltip("File settings")
+                                                                    .on_click(cx.listener(
+                                                                        |this, _, _, cx| {
+                                                                            this.show_tracks =
+                                                                                !this.show_tracks;
+                                                                            this.reveal_controls(
+                                                                                cx,
+                                                                            );
+                                                                            cx.notify();
+                                                                        },
+                                                                    )),
+                                                            )
+                                                            .child(measure_bounds(
+                                                                mixer_trigger_bounds.clone(),
+                                                            )),
+                                                    )
+                                                })
                                                 .child(
                                                     Button::new("fullscreen")
                                                         .ghost()
@@ -1829,58 +1932,76 @@ impl Render for PlayerShell {
                                 .gap_2()
                                 .when(hovered, |s| {
                                     s.child(
-                                        div()
-                                            .occlude()
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(Self::click_overlay),
-                                            )
-                                            .flex()
-                                            .flex_col()
-                                            .gap_2()
-                                            .child(
-                                                Button::new(if next {
-                                                    "next-clip"
-                                                } else {
-                                                    "previous-clip"
-                                                })
-                                                .ghost()
-                                                .icon(if next {
-                                                    IconName::ChevronRight
-                                                } else {
-                                                    IconName::ChevronLeft
-                                                })
-                                                .label(if next { "Next" } else { "Previous" })
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if let Some(path) = this.adjacent(next) {
-                                                        this.load(path, cx);
-                                                    }
-                                                })),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w(px(180.))
-                                                    .p_2()
-                                                    .rounded_md()
-                                                    .bg(cx.theme().popover)
-                                                    .when_some(image, |s, image| {
-                                                        s.child(
-                                                            img(image)
-                                                                .w_full()
-                                                                .h(px(101.))
-                                                                .object_fit(ObjectFit::Contain),
-                                                        )
-                                                    })
-                                                    .child(
-                                                        div().text_xs().truncate().child(
-                                                            target
-                                                                .file_name()
-                                                                .unwrap_or_default()
-                                                                .to_string_lossy()
-                                                                .into_owned(),
-                                                        ),
+                                        Button::new(if next {
+                                            "next-clip"
+                                        } else {
+                                            "previous-clip"
+                                        })
+                                        .ghost()
+                                        .w(px(196.0))
+                                        .h_auto()
+                                        .p_2()
+                                        .rounded_lg()
+                                        .bg(cx.theme().popover)
+                                        .occlude()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(Self::click_overlay),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(path) = this.adjacent(next) {
+                                                this.load(path, cx);
+                                            }
+                                        }))
+                                        .child(
+                                            div()
+                                                .w(px(180.))
+                                                .flex()
+                                                .flex_col()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .gap_1()
+                                                        .child(Icon::new(if next {
+                                                            IconName::ChevronRight
+                                                        } else {
+                                                            IconName::ChevronLeft
+                                                        }))
+                                                        .child(if next {
+                                                            "Next"
+                                                        } else {
+                                                            "Previous"
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(180.0))
+                                                        .h(px(101.25))
+                                                        .flex_shrink_0()
+                                                        .overflow_hidden()
+                                                        .bg(rgb(0x000000))
+                                                        .when_some(image, |s, image| {
+                                                            s.child(
+                                                                img(image)
+                                                                    .w(px(180.0))
+                                                                    .h(px(101.25))
+                                                                    .object_fit(ObjectFit::Contain),
+                                                            )
+                                                        }),
+                                                )
+                                                .child(
+                                                    div().text_xs().truncate().child(
+                                                        target
+                                                            .file_name()
+                                                            .unwrap_or_default()
+                                                            .to_string_lossy()
+                                                            .into_owned(),
                                                     ),
-                                            ),
+                                                ),
+                                        ),
                                     )
                                 }),
                         );
@@ -1894,19 +2015,27 @@ impl Render for PlayerShell {
                     let trigger_bounds = mixer_trigger_bounds.clone();
                     shell.child(
                         div()
-                            .id("audio-mixer-panel")
+                            .id("file-settings-panel")
                             .absolute()
-                            .bottom(px(128.0))
+                            .bottom(file_settings_bottom(
+                                window.viewport_size().height,
+                                trigger_bounds.get(),
+                            ))
                             .right_4()
                             .w(px(380.0))
+                            .max_w(window.viewport_size().width - px(32.0))
+                            .max_h((window.viewport_size().height - px(120.0)).max(px(80.0)))
+                            .overflow_hidden()
                             .occlude()
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
-                            .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                if !trigger_bounds.get().contains(&event.position) {
-                                    this.show_tracks = false;
-                                    cx.notify();
-                                }
-                            }))
+                            .on_mouse_down_out(cx.listener(
+                                move |this, event: &MouseDownEvent, _, cx| {
+                                    if !trigger_bounds.get().contains(&event.position) {
+                                        this.show_tracks = false;
+                                        cx.notify();
+                                    }
+                                },
+                            ))
                             .p_4()
                             .rounded_xl()
                             .bg(cx.theme().popover.opacity(0.96))
@@ -1923,20 +2052,26 @@ impl Render for PlayerShell {
                                         div()
                                             .text_sm()
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Audio mixer"),
+                                            .child("File settings")
+                                            .on_prepaint({
+                                                let bounds =
+                                                    self.file_settings_title_bounds.clone();
+                                                move |area, _, _| bounds.set(area)
+                                            }),
                                     )
                                     .child(
                                         Button::new("close-mixer")
                                             .ghost()
                                             .icon(IconName::Close)
-                                            .tooltip("Close mixer")
+                                            .tooltip("Close file settings")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.show_tracks = false;
                                                 cx.notify();
                                             })),
                                     ),
                             )
-                            .child(self.audio_tracks.clone()),
+                            .child(self.file_settings.clone())
+                            .child(measure_bounds(self.file_settings_panel_bounds.clone())),
                     )
                 },
             )
@@ -1959,12 +2094,14 @@ impl Render for PlayerShell {
                                 })),
                         )
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
-                        .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            if !trigger_bounds.get().contains(&event.position) {
-                                this.show_info = false;
-                                cx.notify();
-                            }
-                        })),
+                        .on_mouse_down_out(cx.listener(
+                            move |this, event: &MouseDownEvent, _, cx| {
+                                if !trigger_bounds.get().contains(&event.position) {
+                                    this.show_info = false;
+                                    cx.notify();
+                                }
+                            },
+                        )),
                     )
                 },
             )
@@ -2039,6 +2176,15 @@ impl Render for PlayerShell {
                 shell.child(self.render_title_bar(&title, window, cx))
             })
             .child(div().relative().flex_1().min_h_0().child(content))
+    }
+}
+
+fn file_settings_bottom(height: Pixels, trigger: Bounds<Pixels>) -> Pixels {
+    if trigger.size.height > px(0.0) && trigger.origin.y > px(0.0) && trigger.origin.y < height {
+        (height - trigger.origin.y + px(8.0)).max(px(60.0))
+    } else {
+        // The first layout has not measured the button yet. Stay on screen.
+        px(60.0)
     }
 }
 
@@ -2246,6 +2392,237 @@ mod overlay_tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
+
+    #[test]
+    fn file_settings_position_uses_measured_button_or_visible_fallback() {
+        use gpui_kit::{Bounds, point, px, size};
+        assert_eq!(
+            super::file_settings_bottom(px(700.0), Bounds::default()),
+            px(60.0)
+        );
+        let trigger = Bounds::new(point(px(800.0), px(644.0)), size(px(32.0), px(32.0)));
+        assert_eq!(super::file_settings_bottom(px(700.0), trigger), px(64.0));
+        assert_eq!(super::file_settings_bottom(px(500.0), trigger), px(60.0));
+    }
+
+    #[test]
+    #[ignore = "interactive GPUI toolbar click and file settings placement"]
+    fn toolbar_opens_visible_file_settings_and_toggles_closed() {
+        use gpui_kit::{
+            MouseButton, MouseDownEvent, MouseUpEvent, WindowBackgroundAppearance, WindowOptions,
+            application, init, px,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let clip = temp.path().join("test.avi");
+        super::playback::test_fixtures::avi_timed(&clip, 1, true, 64, 48, 1, 10);
+        super::clip_store::save_config(
+            &store,
+            &super::clip_store::Config {
+                clip_discovery: super::clip_store::Discovery::Declined,
+                steam_discovery: super::clip_store::Discovery::Declined,
+                muted: true,
+                updates: super::clip_store::UpdateConfig {
+                    automatic_check: false,
+                    automatic_download: false,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result = Arc::new(Mutex::new(None));
+        let report = result.clone();
+        application()
+            .with_assets(app_assets::AppAssets)
+            .run(move |cx| {
+                init(cx);
+                theme::apply(cx);
+                let mut player = None;
+                let handle = cx
+                    .open_window(
+                        WindowOptions {
+                            window_background: WindowBackgroundAppearance::Transparent,
+                            ..Default::default()
+                        },
+                        |window, cx| {
+                            let browser = cx.new(|cx| super::ClipBrowser::for_test(store, cx));
+                            let view = cx.new(|cx| {
+                                let mut shell = PlayerShell::with_browser(browser, window, cx);
+                                shell.load(clip, cx);
+                                shell
+                            });
+                            player = Some(view.clone());
+                            super::player_root(view, window, cx)
+                        },
+                    )
+                    .unwrap();
+                let handle: gpui_kit::AnyWindowHandle = handle.into();
+                let player = player.unwrap();
+                cx.spawn(async move |cx| {
+                    let click =
+                        |window: &mut gpui_kit::Window,
+                         cx: &mut gpui_kit::App,
+                         bounds: gpui_kit::Bounds<gpui_kit::Pixels>| {
+                            let position = gpui_kit::point(
+                                bounds.origin.x + bounds.size.width * 0.5,
+                                bounds.origin.y + bounds.size.height * 0.5,
+                            );
+                            window.dispatch_event(
+                                MouseDownEvent {
+                                    position,
+                                    button: MouseButton::Left,
+                                    click_count: 1,
+                                    ..Default::default()
+                                }
+                                .to_platform_input(),
+                                cx,
+                            );
+                            window.dispatch_event(
+                                MouseUpEvent {
+                                    position,
+                                    button: MouseButton::Left,
+                                    ..Default::default()
+                                }
+                                .to_platform_input(),
+                                cx,
+                            );
+                        };
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    handle
+                        .update(cx, |_, window, cx| {
+                            let bounds = player.read(cx).file_settings_trigger_bounds.get();
+                            click(window, cx, bounds);
+                        })
+                        .unwrap();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let opened = handle
+                        .update(cx, |_, window, cx| {
+                            let shell = player.read(cx);
+                            let panel = shell.file_settings_panel_bounds.get();
+                            let trigger = shell.file_settings_trigger_bounds.get();
+                            let visible = shell.show_tracks
+                                && panel.size.height > px(0.0)
+                                && panel.origin.y >= px(0.0)
+                                && panel.origin.y + panel.size.height <= trigger.origin.y;
+                            let gap = trigger.origin.y - panel.origin.y - panel.size.height;
+                            let in_window = panel.origin.x >= px(0.0)
+                                && panel.origin.x + panel.size.width
+                                    <= window.viewport_size().width;
+                            (
+                                visible && in_window && gap <= px(12.0),
+                                trigger,
+                                shell.file_settings_title_bounds.get(),
+                                panel,
+                            )
+                        })
+                        .unwrap();
+                    handle
+                        .update(cx, |_, window, cx| {
+                            window.dispatch_event(
+                                gpui_kit::ScrollWheelEvent {
+                                    position: gpui_kit::point(
+                                        opened.3.origin.x + px(24.0),
+                                        opened.3.origin.y + px(100.0),
+                                    ),
+                                    delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                                        px(0.0),
+                                        px(-300.0),
+                                    )),
+                                    ..Default::default()
+                                }
+                                .to_platform_input(),
+                                cx,
+                            );
+                        })
+                        .unwrap();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let no_scroll = handle
+                        .update(cx, |_, _, cx| {
+                            let shell = player.read(cx);
+                            shell.file_settings_title_bounds.get() == opened.2
+                                && shell.file_settings.read(cx).scroll_offset()
+                                    == gpui_kit::Point::default()
+                        })
+                        .unwrap();
+                    handle
+                        .update(cx, |_, window, cx| {
+                            let marker_tab = player.read(cx).file_settings.read(cx).tab_bounds(2);
+                            click(window, cx, marker_tab);
+                        })
+                        .unwrap();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let marker_title = handle
+                        .update(cx, |_, window, cx| {
+                            let bounds = player.read(cx).file_settings_panel_bounds.get();
+                            let title = player.read(cx).file_settings_title_bounds.get();
+                            window.dispatch_event(
+                                gpui_kit::ScrollWheelEvent {
+                                    position: gpui_kit::point(
+                                        bounds.origin.x + px(24.0),
+                                        bounds.origin.y + px(100.0),
+                                    ),
+                                    delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                                        px(0.0),
+                                        px(-300.0),
+                                    )),
+                                    ..Default::default()
+                                }
+                                .to_platform_input(),
+                                cx,
+                            );
+                            title
+                        })
+                        .unwrap();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let no_marker_scroll = handle
+                        .update(cx, |_, _, cx| {
+                            let shell = player.read(cx);
+                            let panel = shell.file_settings.read(cx);
+                            panel.active_tab() == 2
+                                && panel.scroll_offset() == gpui_kit::Point::default()
+                                && shell.file_settings_title_bounds.get() == marker_title
+                        })
+                        .unwrap();
+                    handle
+                        .update(cx, |_, window, cx| click(window, cx, opened.1))
+                        .unwrap();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    handle
+                        .update(cx, |_, _, cx| {
+                            let closed = !player.read(cx).show_tracks;
+                            *report.lock().unwrap() =
+                                Some((opened, no_scroll, no_marker_scroll, closed));
+                            player.update(cx, |shell, _| shell.shutdown());
+                            cx.quit();
+                        })
+                        .unwrap();
+                })
+                .detach();
+                cx.activate(true);
+            });
+        let (opened, audio_stationary, markers_stationary, closed) =
+            result.lock().unwrap().take().unwrap();
+        assert!(
+            opened.0,
+            "Panel must open above the toolbar and inside the window: {opened:?}"
+        );
+        assert!(audio_stationary, "Audio content that fits must not scroll");
+        assert!(
+            markers_stationary,
+            "Empty markers must not scroll, and the marker tab must open"
+        );
+        assert!(closed, "Toolbar must toggle the panel closed");
+    }
 
     #[test]
     #[ignore = "interactive GPUI overlay hit-testing with STAR_PLAYER_AUDIO_PROBE media"]

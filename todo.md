@@ -1,3 +1,6 @@
-- [ ] Chapter system with import formats etc. Like youtube and embedded in the video files
-- [ ] Markers in the clips
-- [ ] Fix ui for previous and next clips in the player ui
+Ignore for now
+
+- [ ] Clip Editing (Start and end range) and create a new clip from it
+  - [ ] Dont edit the original clip
+  - [ ] Allow for merging of audio tracks
+  - [ ] Allow for Reencoding / format conversion

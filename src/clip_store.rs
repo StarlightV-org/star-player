@@ -1,4 +1,6 @@
-//! Small, atomic preference and watched-history files. Never replace invalid data.
+//! Atomic preferences and transactional media history. Never replace invalid data.
+#[path = "history_db.rs"]
+mod history_db;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -251,6 +253,7 @@ pub struct MediaState {
     pub watched_at: String,
     pub track_gains: BTreeMap<i64, f64>,
     pub resume_position: Option<f64>,
+    pub file_settings: crate::chapters::FileSettings,
 }
 
 fn legacy_version() -> u32 {
@@ -267,11 +270,17 @@ struct WatchedRow {
     track_gains: String,
     #[serde(default)]
     resume_position: Option<f64>,
+    #[serde(default)]
+    file_settings: String,
 }
 
 pub type History = BTreeMap<String, MediaState>;
 
 pub fn read_history(dir: &Path) -> Result<History, String> {
+    history_db::read(dir)
+}
+
+fn read_legacy_history(dir: &Path) -> Result<History, String> {
     let path = dir.join("watched.csv");
     let file = match fs::File::open(&path) {
         Ok(file) => file,
@@ -285,7 +294,16 @@ pub fn read_history(dir: &Path) -> Result<History, String> {
         .iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    if headers != ["sha256", "watched_at"]
+    if headers
+        != [
+            "sha256",
+            "identity_version",
+            "watched_at",
+            "track_gains",
+            "resume_position",
+            "file_settings",
+        ]
+        && headers != ["sha256", "watched_at"]
         && headers != ["sha256", "identity_version", "watched_at", "track_gains"]
         && headers
             != [
@@ -318,6 +336,13 @@ pub fn read_history(dir: &Path) -> Result<History, String> {
         };
         validate_gains(&track_gains)?;
         validate_resume_position(row.resume_position)?;
+        let file_settings = if row.file_settings.is_empty() {
+            crate::chapters::FileSettings::default()
+        } else {
+            serde_json::from_str::<crate::chapters::FileSettings>(&row.file_settings)
+                .map_err(|e| format!("Invalid file settings: {e}; watched.csv left unchanged"))?
+        };
+        file_settings.validate()?;
         if history
             .insert(
                 row.sha256.to_lowercase(),
@@ -326,6 +351,7 @@ pub fn read_history(dir: &Path) -> Result<History, String> {
                     watched_at: row.watched_at,
                     track_gains,
                     resume_position: row.resume_position,
+                    file_settings,
                 },
             )
             .is_some()
@@ -337,36 +363,7 @@ pub fn read_history(dir: &Path) -> Result<History, String> {
 }
 
 pub fn save_history(dir: &Path, history: &History) -> Result<(), String> {
-    let mut writer = csv::WriterBuilder::new()
-        .has_headers(false)
-        .from_writer(Vec::new());
-    writer
-        .write_record([
-            "sha256",
-            "identity_version",
-            "watched_at",
-            "track_gains",
-            "resume_position",
-        ])
-        .map_err(|e| e.to_string())?;
-    for (sha256, state) in history {
-        validate_gains(&state.track_gains)?;
-        validate_resume_position(state.resume_position)?;
-        writer
-            .serialize(WatchedRow {
-                sha256: sha256.clone(),
-                identity_version: state.identity_version,
-                watched_at: state.watched_at.clone(),
-                track_gains: serde_json::to_string(&state.track_gains)
-                    .map_err(|e| e.to_string())?,
-                resume_position: state.resume_position,
-            })
-            .map_err(|e| e.to_string())?;
-    }
-    atomic_write(
-        &dir.join("watched.csv"),
-        &writer.into_inner().map_err(|e| e.to_string())?,
-    )
+    history_db::save(dir, history)
 }
 
 pub fn hash_filename(path: &Path) -> Result<String, String> {
@@ -414,7 +411,7 @@ pub fn media_state(history: &History, path: &Path) -> MediaState {
 
 pub fn validate_resume_position(position: Option<f64>) -> Result<(), String> {
     if position.is_some_and(|p| !p.is_finite() || p <= 0.0) {
-        return Err("Invalid resume position; watched.csv left unchanged".into());
+        return Err("Invalid resume position; media history left unchanged".into());
     }
     Ok(())
 }
@@ -424,7 +421,7 @@ pub fn validate_gains(gains: &BTreeMap<i64, f64>) -> Result<(), String> {
         .iter()
         .any(|(id, gain)| *id <= 0 || !gain.is_finite() || !(0.0..=10.0).contains(gain))
     {
-        return Err("Invalid audio track gains; watched.csv left unchanged".into());
+        return Err("Invalid audio track gains; media history left unchanged".into());
     }
     Ok(())
 }
@@ -611,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn config_and_csv_roundtrip() {
+    fn config_and_database_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config {
             clip_discovery: Discovery::Declined,
@@ -630,6 +627,23 @@ mod tests {
                 watched_at: "2026-10-14T18:42:00Z".into(),
                 track_gains: BTreeMap::from([(1, 0.4)]),
                 resume_position: Some(123.5),
+                file_settings: crate::chapters::FileSettings {
+                    chapters: crate::chapters::import("0:50 Nightmare (Milan, Italy)", 200.0, &[])
+                        .points,
+                    markers: vec![crate::chapters::Point {
+                        id: 1,
+                        time: 72.0,
+                        title: "A marker, with commas".into(),
+                    }],
+                    embedded_disabled: true,
+                    options: BTreeMap::from([(
+                        "custom:1".into(),
+                        crate::chapters::ChapterOptions {
+                            disabled: false,
+                            auto_skip: true,
+                        },
+                    )]),
+                },
             },
         )]);
         save_history(dir.path(), &history).unwrap();
@@ -645,6 +659,59 @@ mod tests {
         fs::write(dir.path().join("watched.csv"), b"wrong,headers\na,b\n").unwrap();
         assert!(read_history(dir.path()).is_err());
         assert_eq!(fs::read(dir.path().join("config.json")).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn invalid_annotations_do_not_overwrite_database() {
+        let dir = tempfile::tempdir().unwrap();
+        save_history(dir.path(), &History::new()).unwrap();
+        let original = fs::read(dir.path().join("library.db")).unwrap();
+        for points in [
+            vec![crate::chapters::Point {
+                id: 1,
+                time: -1.0,
+                title: "Negative".into(),
+            }],
+            vec![crate::chapters::Point {
+                id: 1,
+                time: 1.0,
+                title: "".into(),
+            }],
+            vec![
+                crate::chapters::Point {
+                    id: 1,
+                    time: 1.0,
+                    title: "One".into()
+                };
+                2
+            ],
+        ] {
+            let mut state = MediaState {
+                identity_version: 2,
+                ..Default::default()
+            };
+            state.file_settings.chapters = points;
+            assert!(save_history(dir.path(), &History::from([("a".repeat(64), state)])).is_err());
+            assert_eq!(fs::read(dir.path().join("library.db")).unwrap(), original);
+        }
+        let mut writer = csv::Writer::from_writer(Vec::new());
+        writer
+            .write_record([
+                "sha256",
+                "identity_version",
+                "watched_at",
+                "track_gains",
+                "resume_position",
+                "file_settings",
+            ])
+            .unwrap();
+        writer
+            .write_record([&"a".repeat(64), "2", "", "{}", "", "{broken}"])
+            .unwrap();
+        let bytes = writer.into_inner().unwrap();
+        fs::write(dir.path().join("watched.csv"), &bytes).unwrap();
+        assert!(read_legacy_history(dir.path()).is_err());
+        assert_eq!(fs::read(dir.path().join("watched.csv")).unwrap(), bytes);
     }
 
     #[test]
@@ -667,7 +734,7 @@ mod tests {
     fn invalid_resume_positions_leave_history_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         save_history(dir.path(), &History::new()).unwrap();
-        let original = fs::read(dir.path().join("watched.csv")).unwrap();
+        let original = fs::read(dir.path().join("library.db")).unwrap();
         for position in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
             let history = History::from([(
                 "a".repeat(64),
@@ -678,7 +745,7 @@ mod tests {
                 },
             )]);
             assert!(save_history(dir.path(), &history).is_err());
-            assert_eq!(fs::read(dir.path().join("watched.csv")).unwrap(), original);
+            assert_eq!(fs::read(dir.path().join("library.db")).unwrap(), original);
         }
         for position in ["NaN", "inf", "-1", "0"] {
             let bytes = format!(
@@ -686,7 +753,7 @@ mod tests {
                 "a".repeat(64)
             );
             fs::write(dir.path().join("watched.csv"), &bytes).unwrap();
-            assert!(read_history(dir.path()).is_err());
+            assert!(read_legacy_history(dir.path()).is_err());
             assert_eq!(
                 fs::read_to_string(dir.path().join("watched.csv")).unwrap(),
                 bytes

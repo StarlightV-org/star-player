@@ -141,9 +141,9 @@ Previous/Next. Their queue contains videos in the same directory, sorted by
 filename, without scanning subdirectories or adding the directory to the library.
 Each edge button appears only when the cursor is near it and a destination exists.
 
-Playback beginning marks a clip watched. `.star-player/watched.csv` contains
-`sha256,identity_version,watched_at,track_gains` records with UTC watched timestamps
-and a JSON map of audio-track IDs to gains. An empty timestamp means unwatched,
+Playback beginning marks a clip watched. `.star-player/library.db` is a SQLite
+database containing media identities, UTC watched timestamps, an optional resume
+position, and JSON audio-track gains and file settings. An empty timestamp means unwatched,
 without discarding saved audio settings. SHA-256 identity combines the immediate
 parent folder name and full filename as separate fields. For example,
 `Desktop/clip.mp4` and `Game/clip.mp4` have different identities, while matching
@@ -155,6 +155,50 @@ records remain readable and migrate as corresponding paths become known. Legacy
 rows remain available for offline folders. Older content-hash records cannot be
 matched without reading media contents and are retained without reinterpretation.
 Bulk **Mark watched** and **Mark unwatched** update the same history.
+
+### Chapters and markers
+
+Open **File settings** from the sliders button beside the seek bar. The Audio
+section retains the per-track volume controls without a separate scroll area.
+Choose **Import** in Chapters to paste lists
+such as `0:50 Nightmare (Milan, Italy)` or `Nightmare (Milan, Italy) 0:50`.
+Both `m:ss` and `h:mm:ss` timestamps work. Review the detected chapters and
+warnings, then confirm the import. Imports append custom chapters, ignore exact
+duplicates, and flag different titles at the same time for review.
+
+Embedded chapters are read-only. Custom chapters can be added, edited, or
+deleted. Each row's **...** menu contains editing, visibility, and auto-skip
+actions. Disable all embedded chapters for a file, or individual chapters,
+without deleting them. Disabled chapters are excluded from timeline navigation
+and do not cause playback to skip. Auto-skip is a separate per-chapter setting.
+A skipped chapter ends at the next chapter from the same source, or the video
+end. Seeking into a skipped chapter immediately skips it again.
+
+The Markers section manages named timestamp bookmarks. Leave the timestamp
+empty to add a chapter or marker at the playhead. Click a timeline marker or
+an enabled chapter in file settings to seek there. Timeline hover previews show
+chapter titles and nearby marker names.
+Chapter boundaries divide the timeline into separate progress segments with
+small gaps, rather than vertical tick marks.
+
+Custom chapters, markers, disabled embedded chapters, and skip settings are
+saved in `library.db`, not in the media file. App-managed renames preserve
+them. On first use, existing `watched.csv` records are validated and imported in
+one transaction; the CSV is left untouched as a backup and is not read again
+after a successful import. Schema upgrades run automatically in a transaction,
+using SQLite's `user_version`. Failed upgrades roll back; databases from newer
+app versions are rejected without changing their data. Previous/Next previews use a single
+clickable card with a fixed 16:9 image area, including for portrait videos.
+
+Database migrations live in `src/history_db.rs`. Append SQL to `MIGRATIONS`
+when changing the schema; never edit a released entry. Each entry advances
+`user_version` by one. Use nullable columns or defaults for existing rows,
+and test upgrades from older versions as well as rollback on failure.
+Adding properties inside JSON file settings does not require a new column,
+but must remain compatible with existing saved settings.
+
+### Clip management
+
 Bulk controls share the sorting toolbar without shifting the clip list. Narrow
 windows use a selection-actions menu. Right-clicking a selected clip acts on the
 selection; right-clicking an unselected clip targets only that clip without
@@ -186,9 +230,9 @@ shows a concise file summary, video codec/resolution/frame rate, audio/subtitle
 track details, chapters and useful tags. Decoder internals and duplicate fields
 are omitted. Errors use GPUI Kit notifications instead of inline banners or
 player error boxes. Repeated playback failures do not notify on every poll.
-The audio mixer and file-information panels close when clicking outside them.
+The file-settings and file-information panels close when clicking outside them.
 Their toggle buttons still open and close them, and clicks inside the panels
-do not dismiss them. An open mixer keeps the player controls visible.
+do not dismiss them. Open file settings keep the player controls visible.
 Keyboard shortcuts are listed in Settings > Keybinds
 and remain accessible with H or ?.
 

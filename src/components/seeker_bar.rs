@@ -21,6 +21,8 @@ pub struct SeekerBar {
     thumbnail: Option<Arc<RenderImage>>,
     thumbnail_time: f64,
     preview_error: Option<String>,
+    chapters: Vec<crate::chapters::Chapter>,
+    markers: Vec<crate::chapters::Point>,
 }
 
 impl EventEmitter<SeekerEvent> for SeekerBar {}
@@ -39,6 +41,8 @@ impl SeekerBar {
             thumbnail: None,
             thumbnail_time: 0.0,
             preview_error: None,
+            chapters: Vec::new(),
+            markers: Vec::new(),
         }
     }
 
@@ -52,6 +56,8 @@ impl SeekerBar {
         self.hover = None;
         self.position = 0.0;
         self.duration = 0.0;
+        self.chapters.clear();
+        self.markers.clear();
         cx.notify();
     }
 
@@ -90,6 +96,19 @@ impl SeekerBar {
             }
         }
         cx.notify();
+    }
+
+    pub fn set_annotations(
+        &mut self,
+        chapters: Vec<crate::chapters::Chapter>,
+        markers: Vec<crate::chapters::Point>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chapters != chapters || self.markers != markers {
+            self.chapters = chapters;
+            self.markers = markers;
+            cx.notify();
+        }
     }
 
     fn pointer_time(&self, x: Pixels) -> f64 {
@@ -140,6 +159,25 @@ pub fn timestamp(seconds: f64) -> String {
     }
 }
 
+fn chapter_segments(chapters: &[crate::chapters::Chapter], duration: f64) -> Vec<(f64, f64)> {
+    if !duration.is_finite() || duration <= 0.0 {
+        return Vec::new();
+    }
+    let mut boundaries = vec![0.0, duration];
+    boundaries.extend(
+        chapters
+            .iter()
+            .filter(|c| !c.disabled && c.time.is_finite() && c.time > 0.0 && c.time < duration)
+            .map(|c| c.time),
+    );
+    boundaries.sort_by(f64::total_cmp);
+    boundaries.dedup();
+    boundaries
+        .windows(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect()
+}
+
 impl Render for SeekerBar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let fraction = if self.duration > 0.0 {
@@ -150,6 +188,8 @@ impl Render for SeekerBar {
         let bounds = self.bounds.clone();
         let width = f32::from(self.bounds.get().size.width);
         let hover = self.hover;
+        let segments = chapter_segments(&self.chapters, self.duration);
+        let segmented = segments.len() > 1;
         // The transparent GPUI composition layer hosts the preview above the
         // native video. No permanently reserved thumbnail strip is needed.
         div()
@@ -203,24 +243,60 @@ impl Render for SeekerBar {
                         .absolute()
                         .size_full(),
                     )
-                    .child(
+                    .when(segments.is_empty(), |bar| {
+                        bar.child(
+                            div()
+                                .absolute()
+                                .top(px(10.0))
+                                .h(px(3.0))
+                                .w_full()
+                                .bg(cx.theme().muted),
+                        )
+                    })
+                    .children(segments.iter().map(|(start, end)| {
+                        let progress =
+                            ((self.position - start) / (end - start)).clamp(0.0, 1.0) as f32;
                         div()
                             .absolute()
-                            .top(px(10.0))
-                            .h(px(3.0))
-                            .w_full()
-                            .rounded_full()
-                            .bg(cx.theme().muted),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(10.0))
-                            .h(px(3.0))
-                            .w(relative(fraction))
-                            .rounded_full()
-                            .bg(cx.theme().primary),
-                    )
+                            .top(px(9.5))
+                            .h(px(4.0))
+                            .left(relative((start / self.duration) as f32))
+                            .w(relative(((end - start) / self.duration) as f32))
+                            .pl(px(if segmented && *start > 0.0 { 1.5 } else { 0.0 }))
+                            .pr(px(if segmented && *end < self.duration {
+                                1.5
+                            } else {
+                                0.0
+                            }))
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .h_full()
+                                    .rounded_sm()
+                                    .overflow_hidden()
+                                    .bg(cx.theme().muted)
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .h_full()
+                                            .w(relative(progress))
+                                            .bg(cx.theme().primary),
+                                    ),
+                            )
+                    }))
+                    .when(self.duration > 0.0, |bar| {
+                        bar.child(
+                            div()
+                                .absolute()
+                                .top(px(5.5))
+                                .left(relative(fraction))
+                                .ml(px(-6.0))
+                                .size(px(12.0))
+                                .rounded_full()
+                                .bg(cx.theme().primary),
+                        )
+                    })
                     .when_some(hover, |bar, seconds| {
                         let left = ((seconds / self.duration.max(1.0)) as f32 * width - 120.0)
                             .clamp(0.0, (width - 240.0).max(0.0));
@@ -262,6 +338,29 @@ impl Render for SeekerBar {
                                             )
                                         },
                                     )
+                                    .children(
+                                        self.chapters
+                                            .iter()
+                                            .filter(|c| {
+                                                !c.disabled && c.time <= seconds && seconds < c.end
+                                            })
+                                            .map(|c| div().px_2().text_xs().child(c.title.clone())),
+                                    )
+                                    .children(
+                                        self.markers
+                                            .iter()
+                                            .filter(|m| {
+                                                (m.time - seconds).abs()
+                                                    <= self.duration / f64::from(width.max(1.0))
+                                                        * 8.0
+                                            })
+                                            .map(|m| {
+                                                div()
+                                                    .px_2()
+                                                    .text_xs()
+                                                    .child(format!("Marker: {}", m.title))
+                                            }),
+                                    )
                                     .child(div().p_2().text_xs().child(timestamp(
                                         if self.thumbnail.is_some() {
                                             self.thumbnail_time
@@ -272,7 +371,31 @@ impl Render for SeekerBar {
                             )
                             .with_priority(10),
                         )
-                    }),
+                    })
+                    .children(
+                        self.markers
+                            .iter()
+                            .filter(|m| self.duration > 0.0 && m.time < self.duration)
+                            .map(|marker| {
+                                let time = marker.time;
+                                div()
+                                    .id(("timeline-marker", marker.id))
+                                    .absolute()
+                                    .left(relative((time / self.duration).clamp(0.0, 1.0) as f32))
+                                    .top(px(0.0))
+                                    .w(px(8.0))
+                                    .h(px(7.0))
+                                    .rounded_sm()
+                                    .bg(cx.theme().primary)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.emit(SeekerEvent::Seek(time));
+                                        }),
+                                    )
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -286,7 +409,34 @@ impl Render for SeekerBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{hover_time, timestamp};
+    use super::{chapter_segments, hover_time, timestamp};
+
+    #[test]
+    fn chapter_segments_cover_the_video_and_ignore_hidden_duplicates() {
+        let mut settings = crate::chapters::FileSettings::default();
+        settings.chapters = crate::chapters::import("0:10 One\n0:30 Two", 60.0, &[]).points;
+        let metadata = std::collections::BTreeMap::from([(
+            "chapter-list".into(),
+            serde_json::json!([{"time":10},{"time":20}]),
+        )]);
+        assert_eq!(
+            chapter_segments(&settings.chapters(&metadata, 60.0), 60.0),
+            vec![(0.0, 10.0), (10.0, 20.0), (20.0, 30.0), (30.0, 60.0)]
+        );
+        settings.embedded_disabled = true;
+        settings
+            .options
+            .entry("custom:1".into())
+            .or_default()
+            .disabled = true;
+        assert_eq!(
+            chapter_segments(&settings.chapters(&metadata, 60.0), 60.0),
+            vec![(0.0, 30.0), (30.0, 60.0)]
+        );
+        assert_eq!(chapter_segments(&[], 60.0), vec![(0.0, 60.0)]);
+        assert!(chapter_segments(&[], 0.0).is_empty());
+        assert!(chapter_segments(&[], f64::NAN).is_empty());
+    }
     #[test]
     fn formats_timestamps() {
         assert_eq!(timestamp(65.0), "01:05");
