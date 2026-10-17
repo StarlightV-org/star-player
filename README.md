@@ -235,7 +235,8 @@ history. These buttons do not seek or step through the folder's video list.
 | Selected track volume            | `-` / `+` or `=`              |
 | Toggle selected track            | A                             |
 | Fullscreen                       | F                             |
-| Show/hide shortcut help          | H or ?                        |
+| Toggle player focus mode        | H                             |
+| Show/hide shortcut help          | Assign in Settings > Keybinds |
 | Hide shortcut help               | Escape                        |
 | Reload custom theme              | Ctrl+Shift+T                  |
 
@@ -310,7 +311,9 @@ prefix waits until that timeout before running.
 
 Choose a predefined context or enter an expression using `&&`, `||`, `!` and
 parentheses. Available contexts are Application, Player, ClipLibrary, Settings,
-TextInput, Dialog, KeybindEditor, paused, playing, fullscreen, folder and selected.
+TextInput, Dialog, KeybindEditor, paused, playing, fullscreen, focus_mode, folder
+and selected. The focus_mode context is active only in the player while focus
+mode is enabled, for example `Player && focus_mode` or `Player && !focus_mode`.
 For example, `Player && (paused || !fullscreen)`. Input fields and modal dialogs
 require bindings that explicitly include TextInput or Dialog, respectively.
 More specific contexts take precedence; user bindings win ties with defaults.
@@ -369,11 +372,16 @@ The video host fills the player area below the custom title bar without padding
 or a reserved control strip. It is hidden while browsing the library.
 Video keeps its original aspect ratio; mismatched window sizes
 can still have letterboxing. Compact translucent controls float over the video
-and disappear after three seconds of idle playback. Mouse movement or keyboard
-input brings them back. Controls stay visible while paused or dragging a slider.
-Open mixer and shortcut panels hide with the controls during idle playback and
-reappear on mouse movement or pause. The mixer button opens individual track
-sliders; thumbnails appear above the timeline without taking permanent space.
+and disappear after 1.5 seconds of inactivity, including while paused or stopped.
+Mouse movement or keyboard commands bring them back, except frame-by-frame
+stepping, which leaves their visibility unchanged. Dragging a slider or opening
+the mixer, file information or shortcut help keeps controls visible.
+Press H in the player to toggle focus mode. It hides the player UI until H is
+pressed again, even when using the mouse or playback shortcuts. The title bar
+stays visible outside fullscreen.
+Focus mode does not hide Settings or the library and resets on returning to the
+library. The mixer button opens individual track sliders; thumbnails appear
+above the timeline without taking permanent space.
 
 The child cannot take input focus, so GPUI keeps keyboard control. Panel bounds
 use physical pixels calculated from GPUI layout and its display scale. Windows

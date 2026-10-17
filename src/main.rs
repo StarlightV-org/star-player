@@ -151,6 +151,7 @@ struct PlayerShell {
     title_focus: FocusHandle,
     show_tracks: bool,
     controls_visible: bool,
+    focus_mode: bool,
     controls_opacity: f32,
     controls_frame: Instant,
     controls_dragging: bool,
@@ -573,6 +574,7 @@ impl PlayerShell {
             title_focus: cx.focus_handle(),
             show_tracks: false,
             controls_visible: true,
+            focus_mode: false,
             controls_opacity: 1.0,
             controls_frame: Instant::now(),
             controls_dragging: false,
@@ -636,7 +638,9 @@ impl PlayerShell {
             _ => {}
         }
         self.video_click.take();
-        self.reveal_controls(cx);
+        if command_reveals_controls(&command) {
+            self.reveal_controls(cx);
+        }
         if let Some(player) = &self.playback {
             if let Err(error) = player.send(command) {
                 self.error = Some(error);
@@ -693,6 +697,9 @@ impl PlayerShell {
     }
 
     fn reveal_controls(&mut self, cx: &mut Context<Self>) {
+        if self.player_focus_mode() {
+            return;
+        }
         self.last_activity = Instant::now();
         if let Some(host) = &self.native_video {
             host.set_cursor_hidden(false);
@@ -702,6 +709,10 @@ impl PlayerShell {
             self.controls_frame = Instant::now();
             cx.notify();
         }
+    }
+
+    fn player_focus_mode(&self) -> bool {
+        self.focus_mode && self.path.is_some() && !self.show_settings
     }
 
     fn shutdown(&mut self) {
@@ -1018,6 +1029,7 @@ impl PlayerShell {
             }
         }
         let controls_visible = controls_should_show(
+            self.player_focus_mode(),
             self.path.is_none()
                 || self.show_settings
                 || self.show_info
@@ -1026,7 +1038,6 @@ impl PlayerShell {
                 || self.title_hovered
                 || self.title_focus.is_focused(window)
                 || self.rename_busy
-                || self.snapshot.paused
                 || self.volume_controls.read(cx).interacting(window, cx)
                 || self.hover_navigation.is_some()
                 || self.snapshot.error.is_some(),
@@ -1064,6 +1075,9 @@ impl PlayerShell {
         if window.is_fullscreen() {
             scope.values.push("fullscreen");
         }
+        if self.player_focus_mode() {
+            scope.values.push("focus_mode");
+        }
         if window.has_active_dialog(cx) {
             scope.values.push("Dialog");
         }
@@ -1094,8 +1108,29 @@ impl PlayerShell {
     }
 
     fn run_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.reveal_controls(cx);
+        if !matches!(action, "frame_back" | "frame_forward" | "focus_mode") {
+            self.reveal_controls(cx);
+        }
         let command = match action {
+            "focus_mode" => {
+                self.focus_mode = !self.focus_mode;
+                if self.focus_mode {
+                    self.controls_visible = false;
+                    self.controls_opacity = 0.0;
+                    self.controls_frame = Instant::now();
+                    self.show_help = false;
+                    self.show_info = false;
+                    self.show_tracks = false;
+                    self.title_hovered = false;
+                    window.focus(&self.focus, cx);
+                    if let Some(host) = &self.native_video {
+                        host.set_cursor_hidden(true);
+                    }
+                } else {
+                    self.reveal_controls(cx);
+                }
+                None
+            }
             "open" => {
                 self.open(window, cx);
                 None
@@ -1240,6 +1275,7 @@ impl PlayerShell {
             host.hide();
         }
         self.path = None;
+        self.focus_mode = false;
         self.snapshot = Snapshot::default();
         self.notified_playback_error = None;
         self.hover_navigation = None;
@@ -1328,6 +1364,10 @@ impl PlayerShell {
 
 impl Render for PlayerShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.player_focus_mode() {
+            self.controls_visible = false;
+            self.controls_opacity = 0.0;
+        }
         let now = Instant::now();
         self.controls_opacity = advance_controls_opacity(
             self.controls_opacity,
@@ -1430,7 +1470,7 @@ impl Render for PlayerShell {
                         .child(self.browser.clone()),
                 )
             })
-            .when(self.resume_prompt.is_some() && self.path.is_some() && !self.show_settings, |shell| {
+            .when(self.resume_prompt.is_some() && self.path.is_some() && !self.show_settings && !self.player_focus_mode(), |shell| {
                 let position = self.resume_prompt.as_ref().unwrap().position;
                 let seconds = position.floor() as u64;
                 let timestamp = if seconds >= 3600 {
@@ -1951,8 +1991,17 @@ fn reduced_motion() -> bool {
     false
 }
 
-fn controls_should_show(persistent: bool, interacting: bool, idle: Duration) -> bool {
-    persistent || interacting || idle < Duration::from_secs(3)
+fn command_reveals_controls(command: &Command) -> bool {
+    !matches!(command, Command::FrameStep | Command::FrameBackStep)
+}
+
+fn controls_should_show(
+    focus_mode: bool,
+    persistent: bool,
+    interacting: bool,
+    idle: Duration,
+) -> bool {
+    !focus_mode && (persistent || interacting || idle < Duration::from_millis(1500))
 }
 
 fn double_click_interval() -> Duration {
@@ -1966,7 +2015,9 @@ fn double_click_interval() -> Duration {
 
 #[cfg(test)]
 mod styling_tests {
-    use super::{advance_controls_opacity, controls_should_show};
+    use super::{
+        Command, advance_controls_opacity, command_reveals_controls, controls_should_show,
+    };
 
     #[test]
     fn controls_animation_reverses_without_jumping_and_respects_reduced_motion() {
@@ -1990,11 +2041,53 @@ mod styling_tests {
     use std::time::Duration;
 
     #[test]
-    fn controls_hide_only_during_idle_playback() {
-        assert!(controls_should_show(false, false, Duration::from_secs(2)));
-        assert!(!controls_should_show(false, false, Duration::from_secs(3)));
-        assert!(controls_should_show(true, false, Duration::from_secs(10)));
-        assert!(controls_should_show(false, true, Duration::from_secs(10)));
+    fn controls_hide_after_short_idle_regardless_of_playback_state() {
+        assert!(controls_should_show(
+            false,
+            false,
+            false,
+            Duration::from_millis(1499)
+        ));
+        assert!(!controls_should_show(
+            false,
+            false,
+            false,
+            Duration::from_millis(1500)
+        ));
+        assert!(controls_should_show(
+            false,
+            true,
+            false,
+            Duration::from_secs(10)
+        ));
+        assert!(controls_should_show(
+            false,
+            false,
+            true,
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[test]
+    fn focus_mode_overrides_activity_and_open_panels() {
+        for persistent in [false, true] {
+            for interacting in [false, true] {
+                assert!(!controls_should_show(
+                    true,
+                    persistent,
+                    interacting,
+                    Duration::ZERO
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn frame_steps_do_not_reveal_controls() {
+        assert!(!command_reveals_controls(&Command::FrameStep));
+        assert!(!command_reveals_controls(&Command::FrameBackStep));
+        assert!(command_reveals_controls(&Command::Toggle));
+        assert!(command_reveals_controls(&Command::SeekRelative(10.0)));
     }
 }
 

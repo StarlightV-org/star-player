@@ -65,12 +65,7 @@ pub fn actions() -> Vec<Action> {
             "Player",
             "left|j|media-previous",
         ),
-        (
-            "seek_forward",
-            "Seek forward 10 seconds",
-            "Player",
-            "right",
-        ),
+        ("seek_forward", "Seek forward 10 seconds", "Player", "right"),
         (
             "seek_back_long",
             "Seek backward 60 seconds",
@@ -103,15 +98,27 @@ pub fn actions() -> Vec<Action> {
         ("track_down", "Decrease track volume", "Player", ""),
         ("track_up", "Increase track volume", "Player", ""),
         ("track_toggle", "Toggle audio track", "Player", ""),
+        ("focus_mode", "Toggle focus mode", "Player", "h"),
+        ("focus_mode", "Exit focus mode", "Player && focus_mode", "escape"),
         ("fullscreen", "Toggle fullscreen", "Player", "f"),
-        ("fullscreen", "Exit fullscreen", "Player && fullscreen", "escape"),
+        (
+            "fullscreen",
+            "Exit fullscreen",
+            "Player && fullscreen && !focus_mode",
+            "escape",
+        ),
         ("help", "Toggle keyboard shortcuts", "Player", ""),
         ("dismiss", "Dismiss panels", "Player", "escape"),
         ("close_settings", "Close settings", "Settings", "escape"),
         ("select_all", "Select all clips", "ClipLibrary", "ctrl-a"),
         ("deselect", "Deselect clips", "ClipLibrary", "escape"),
         ("delete", "Delete selected clips", "ClipLibrary", "delete"),
-        ("library", "Return to library", "Player && !fullscreen", "escape"),
+        (
+            "library",
+            "Return to library",
+            "Player && !fullscreen && !focus_mode",
+            "escape",
+        ),
         ("previous_clip", "Previous clip", "Player", ""),
         ("next_clip", "Next clip", "Player", ""),
         ("info", "Toggle file information", "Player", ""),
@@ -281,6 +288,7 @@ pub const CONTEXTS: &[&str] = &[
     "paused",
     "playing",
     "fullscreen",
+    "focus_mode",
     "folder",
     "selected",
 ];
@@ -294,6 +302,7 @@ pub const PRESETS: &[&str] = &[
     "KeybindEditor",
     "Player && paused",
     "Player && playing",
+    "Player && focus_mode",
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -690,7 +699,7 @@ fn overlaps(a: &str, b: &str) -> bool {
     };
     // Enumerate realizable app states rather than treating unrelated pages as conflicts.
     for page in ["Player", "ClipLibrary", "Settings"] {
-        for bits in 0..128 {
+        for bits in 0..256 {
             let mut scope = Scope::new(["Application", page]);
             for (i, name) in [
                 "paused",
@@ -700,6 +709,7 @@ fn overlaps(a: &str, b: &str) -> bool {
                 "TextInput",
                 "Dialog",
                 "KeybindEditor",
+                "focus_mode",
             ]
             .iter()
             .enumerate()
@@ -712,6 +722,7 @@ fn overlaps(a: &str, b: &str) -> bool {
                 scope.values.push("playing");
             }
             if (scope.has("paused") && page != "Player")
+                || (scope.has("focus_mode") && page != "Player")
                 || (scope.has("KeybindEditor") && page != "Settings")
             {
                 continue;
@@ -727,6 +738,30 @@ fn overlaps(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn focus_mode_shortcut_is_scoped_to_player() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = Keymap::open(dir.path().join("keybinds.json"));
+        for state in ["playing", "paused"] {
+            assert_eq!(
+                map.feed("h", Scope::new(["Application", "Player", state])),
+                (Some("focus_mode".into()), true)
+            );
+        }
+        for page in ["ClipLibrary", "Settings"] {
+            assert_eq!(
+                map.feed("h", Scope::new(["Application", page])),
+                (None, false)
+            );
+        }
+        for blocked in ["TextInput", "Dialog"] {
+            assert_eq!(
+                map.feed("h", Scope::new(["Application", "Player", blocked])),
+                (None, false)
+            );
+        }
+    }
+
     #[test]
     fn namespaced_references_resolve_without_breaking_existing_keymaps() {
         let actions = actions();
@@ -889,6 +924,8 @@ mod tests {
     #[test]
     fn contexts_and_conflicts() {
         assert!(validate_context("Player && (paused || !fullscreen)").is_ok());
+        assert!(validate_context("Player && focus_mode").is_ok());
+        assert!(validate_context("Player && !focus_mode").is_ok());
         for invalid in ["", "Player &&", "Unknown", "(Player", "Player Settings"] {
             assert!(validate_context(invalid).is_err());
         }
@@ -897,6 +934,38 @@ mod tests {
         assert!(!overlaps("Player && paused", "Player && !paused"));
         assert!(!overlaps("Player", "KeybindEditor"));
         assert!(!overlaps("paused", "Settings"));
+        assert!(overlaps("focus_mode", "Player && paused"));
+        assert!(overlaps("focus_mode", "Player && playing"));
+        assert!(!overlaps("focus_mode", "!focus_mode"));
+        assert!(!overlaps("focus_mode", "Settings"));
+        assert!(!overlaps("focus_mode", "ClipLibrary"));
+    }
+
+    #[test]
+    fn focus_mode_context_matches_only_when_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = Keymap::open(dir.path().join("keybinds.json"));
+        map.save(
+            None,
+            Binding {
+                action: "pause".into(),
+                keys: "ctrl-h".into(),
+                context: "Player && focus_mode".into(),
+                disabled: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            map.feed("ctrl-h", Scope::new(["Application", "Player"])),
+            (None, false)
+        );
+        assert_eq!(
+            map.feed(
+                "ctrl-h",
+                Scope::new(["Application", "Player", "focus_mode"])
+            ),
+            (Some("pause".into()), true)
+        );
     }
     #[test]
     fn overrides_only_and_removal_survives_reload() {
