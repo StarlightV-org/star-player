@@ -6,9 +6,10 @@ MinIO and an installer are not required.
 
 Settings > About contains separate automatic-check and automatic-download
 preferences, both enabled by default, plus a manual check/download/restart
-button. Release builds check after ten seconds and every six hours while open.
-Development builds only check manually. Disabling downloads affects future
-downloads; an in-progress download finishes. Restarts always require a click.
+button. The app checks at startup as soon as saved preferences load, then every
+six hours while open. This also applies to development builds. Disabling
+downloads affects future downloads; an in-progress download finishes.
+Restarts always require a click.
 
 Network work runs on a worker thread. The title bar shows checking, download
 percentage, verification, errors/retry, and restart availability. The running

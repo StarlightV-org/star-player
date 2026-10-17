@@ -44,7 +44,8 @@ versions in the background. Both preferences default to on and can be changed
 in **Settings > About**, which also provides a manual check. The title bar shows
 update progress and **Restart to update** when ready. Updates never restart the
 app automatically and do not require an installer. Network failures leave local
-playback available. Development builds do not check automatically.
+playback available. Checks run at startup after settings load, including in
+development builds, and every six hours while the app remains open.
 
 Updates require signed release metadata and a verification key embedded in the
 app. See [release setup and recovery](docs/updates.md) for the one-time GitHub

@@ -77,7 +77,6 @@ pub struct Updater {
     pub state: State,
     tx: Sender<State>,
     rx: Receiver<State>,
-    started: Instant,
     last_check: Option<Instant>,
 }
 
@@ -88,7 +87,6 @@ impl Default for Updater {
             state: State::Idle,
             tx,
             rx,
-            started: Instant::now(),
             last_check: None,
         }
     }
@@ -105,21 +103,25 @@ impl Updater {
             self.download();
             changed = true;
         }
-        // Development builds never contact GitHub automatically.
-        if !cfg!(debug_assertions)
+        // Start once saved preferences are loaded, including development builds.
+        // Unit tests exercise scheduling without making real network requests.
+        if !cfg!(test)
             && cfg!(all(windows, target_arch = "x86_64"))
-            && config.automatic_check
-            && self.started.elapsed() >= Duration::from_secs(10)
-            && self
-                .last_check
-                .is_none_or(|last| last.elapsed() >= INTERVAL)
-            && !self.state.busy()
-            && !matches!(self.state, State::Ready(..) | State::Available(_))
+            && self.should_check(config, Instant::now())
         {
             self.check();
             changed = true;
         }
         changed
+    }
+
+    fn should_check(&self, config: &crate::clip_store::UpdateConfig, now: Instant) -> bool {
+        config.automatic_check
+            && self
+                .last_check
+                .is_none_or(|last| now.saturating_duration_since(last) >= INTERVAL)
+            && !self.state.busy()
+            && !matches!(self.state, State::Ready(..) | State::Available(_))
     }
 
     pub fn check(&mut self) {
@@ -645,5 +647,40 @@ mod tests {
         updater.state = State::PreparingRestart;
         updater.check();
         assert!(matches!(updater.state, State::PreparingRestart));
+    }
+
+    #[test]
+    fn startup_checks_immediately_and_respects_saved_preference() {
+        let updater = Updater::default();
+        let enabled = crate::clip_store::UpdateConfig::default();
+        assert!(updater.should_check(&enabled, Instant::now()));
+        let disabled = crate::clip_store::UpdateConfig {
+            automatic_check: false,
+            ..enabled
+        };
+        assert!(!updater.should_check(&disabled, Instant::now()));
+    }
+
+    #[test]
+    fn automatic_checks_wait_for_interval_and_do_not_interrupt_updates() {
+        let now = Instant::now();
+        let config = crate::clip_store::UpdateConfig::default();
+        let mut updater = Updater {
+            last_check: Some(now),
+            ..Updater::default()
+        };
+        assert!(!updater.should_check(&config, now));
+        assert!(!updater.should_check(&config, now + INTERVAL - Duration::from_secs(1)));
+        assert!(updater.should_check(&config, now + INTERVAL));
+        for state in [
+            State::Checking,
+            State::Downloading(0, 1),
+            State::Verifying,
+            State::Ready(PathBuf::new(), "999.0.0".into()),
+            State::PreparingRestart,
+        ] {
+            updater.state = state;
+            assert!(!updater.should_check(&config, now + INTERVAL));
+        }
     }
 }
