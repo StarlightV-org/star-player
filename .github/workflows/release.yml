@@ -1,16 +1,23 @@
-name: Release portable Windows app
+name: Build and release portable Windows app
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v[0-9]*.[0-9]*.[0-9]*'
+  workflow_dispatch:
+
+env:
+  # Keep main-branch cache warming and tagged builds on the same compiler.
+  RUSTUP_TOOLCHAIN: '1.95.0'
 
 permissions:
   contents: read
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   build:
@@ -26,6 +33,15 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Test signing contract
         run: bun run test:release
+      - name: Set up Rust
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --target x86_64-pc-windows-msvc
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x86_64-release
+          cache-on-failure: true
+          # Other tags cannot reuse a previous tag's cache. Seed it on main.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Validate version and verification key
         shell: pwsh
         run: |
@@ -36,30 +52,39 @@ jobs:
             throw 'Expected a base64-encoded 32-byte Ed25519 public key'
           }
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
-          if ($env:GITHUB_REF_NAME -ne "v$version" -or $version.Contains('-')) {
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and ($env:GITHUB_REF_NAME -ne "v$version" -or $version.Contains('-'))) {
             throw 'Tag must match the stable Cargo.toml version'
           }
-      - name: Set up Rust
-        run: rustup update stable --no-self-update
       - name: Test updater
         run: |
-          cargo +stable test --locked --bin star-player updater::tests
+          cargo test --release --locked --target x86_64-pc-windows-msvc --timings --bin star-player updater::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo +stable test --locked --bin star-player update_preferences_persist
+          cargo test --release --locked --target x86_64-pc-windows-msvc --timings --bin star-player update_preferences_persist
       - name: Build portable executable
-        run: cargo +stable build --release --locked --target x86_64-pc-windows-msvc
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --timings
+      - name: Upload Cargo timing reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-timings
+          path: target/**/cargo-timings/*.html
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Stage executable
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/star-player.exe dist/star-player-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         with:
           name: windows-portable
           path: dist/star-player-windows-x86_64.exe
           if-no-files-found: error
 
   publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     environment: release

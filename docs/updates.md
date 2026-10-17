@@ -55,6 +55,26 @@ push command to retry. Do not rerun the script to retry that release.
 on Windows, transfers the executable to an isolated publishing job, signs the
 metadata, uploads every asset to a draft release, and publishes it last.
 
+### CI build cache and timings
+
+The workflow also builds on pushes to `main` to warm the Rust dependency cache
+that tagged releases can restore. Main-branch builds never publish a release
+or access the release signing environment. Use **Run workflow** on `main` to
+seed the cache manually before tagging. The first cold build will still take
+longer; a tag pushed before the warm-up finishes cannot use that new cache yet.
+
+Rust is pinned to 1.95.0 in the workflow. Tests and the executable use the same
+release profile and `x86_64-pc-windows-msvc` target so most dependencies can be
+reused. The test executable and shipping executable still require separate
+compilation/linking. Shipping optimization settings are unchanged by the CI
+workflow. Update the pinned compiler deliberately; doing so starts a new cache.
+
+Every build uploads available HTML reports as the `windows-build-timings`
+artifact, including on failure. These reports identify expensive compilation
+units and build-script execution. Reports are retained for 14 days. Decoder
+bundle preparation is not separately cached yet; measure it before changing
+the bundling code or release optimization settings.
+
 Required release assets:
 
 - `star-player-windows-x86_64.exe`, a standalone executable, not an installer.
