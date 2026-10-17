@@ -5,12 +5,16 @@
   "private": true,
   "scripts": {
     "release": "bun scripts/release.ts",
-    "test:release": "bun test scripts/release.test.ts"
+    "publish:release": "bun scripts/publish.ts",
+    "test:release": "bun test --timeout 30000 scripts/release.test.ts scripts/publish.test.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^7"
+  },
+  "dependencies": {
+    "@starlightv-org/print": "^0.1.5"
   }
 }

@@ -4,6 +4,9 @@
   "workspaces": {
     "": {
       "name": "spacer",
+      "dependencies": {
+        "@starlightv-org/print": "^0.1.5",
+      },
       "devDependencies": {
         "@types/bun": "latest",
       },
@@ -13,6 +16,8 @@
     },
   },
   "packages": {
+    "@starlightv-org/print": ["@starlightv-org/print@0.1.5", "", {}, "sha512-WMIYf5PK+yiA3sROkn4jaQSxJZuZLlGawgMgwYdUoOjwK1bp0XJcyr+wWi2O7j3w4P2HioxL2IRNlbrRXIIsFg=="],
+
     "@types/bun": ["@types/bun@1.4.3", "", { "dependencies": { "bun-types": "1.4.3" } }, "sha512-N67Pqy8JXbAY/j0tNraS3V5mubGvc6rrrNDmDCtZLlFzccbUJPDb0tvgUBC5q4m8ybkP93Jcn1QB+RYQ6PvBhw=="],
 
     "@types/node": ["@types/node@26.6.5", "", { "dependencies": { "undici-types": "~8.9.0" } }, "sha512-uMzsv9stDdofIZBx4UGh4Z9ZgXnGC9seRDscilBcTHAeOFk67MZg/k9bWVfO+bk4qZmG+l52hRnLwUiH2LnJTg=="],

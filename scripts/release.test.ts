@@ -96,8 +96,13 @@ test("key generation emits the existing base64 raw-key format", () => {
   const result = Bun.spawnSync([process.execPath, join(import.meta.dir, "release.ts"), "--generate-key"]);
   expect(result.exitCode).toBe(0);
   const lines = result.stdout.toString().trim().split(/\r?\n/);
-  const seed = Buffer.from(lines[1]!, "base64");
-  const publicKey = Buffer.from(lines[3]!, "base64");
+  const seedLine = lines[1];
+  const publicKeyLine = lines[3];
+  if (seedLine === undefined || publicKeyLine === undefined) {
+    throw new Error("Key generation did not emit both key values");
+  }
+  const seed = Buffer.from(seedLine, "base64");
+  const publicKey = Buffer.from(publicKeyLine, "base64");
   expect(seed.length).toBe(32);
   expect(publicKey.length).toBe(32);
   expect(rawPublicKey(privateKeyFromSeed(seed)).equals(publicKey)).toBe(true);

@@ -1,2 +1,3 @@
-- [ ] For Videos longer then 10 minutes, save the current playback time and promtp to resume after reopening. This should be a small Toast at the bottom of the video that appears when the video is reopened. It should stay open for 15s, and then automatically dismiss. Ich the useer hovers over it, it should not close. Add an x to dismiss it manually.
-- [ ] When Pausing, and then moveing frame by frame, There is still audio for the first few frames
+- [ ] Chapter system with import formats etc. Like youtube and embedded in the video files
+- [ ] Markers in the clips
+- [ ] Fix ui for previous and next clips in the player ui

@@ -34,8 +34,23 @@ official release must already contain the key to accept later updates.
 
 ## Publish
 
-Set `package.version` in Cargo.toml and update Cargo.lock, then push the matching
-stable tag, for example `v0.2.0`. `.github/workflows/release.yml` builds and tests
+Run `bun run publish:release` to select a version, create an annotated `vX.Y.Z`
+tag, and push the current branch and tag atomically to `origin`. Use
+`bun run publish:release --remote NAME` for another configured remote.
+
+The script compares StarPlayer's version in Cargo.lock with the highest stable
+version tag, fetching remote tags first. If unchanged, it increases the patch
+by one. If you already set a newer Cargo.lock version, it uses that value.
+Without an existing stable tag, it publishes the current version unchanged.
+It synchronizes Cargo.toml and Cargo.lock, commits version changes when needed,
+and refuses downgrades or a branch that does not contain the last release.
+
+Commit application changes before running it. Only package-version edits in
+the Cargo files may be uncommitted; unrelated changes are never auto-committed.
+If a push fails, the script retains the local commit/tag and prints the exact
+push command to retry. Do not rerun the script to retry that release.
+
+`.github/workflows/release.yml` builds and tests
 on Windows, transfers the executable to an isolated publishing job, signs the
 metadata, uploads every asset to a draft release, and publishes it last.
 
