@@ -409,6 +409,56 @@ pub(super) fn setting_row(title: &'static str, description: &'static str, cx: &A
 }
 
 impl ClipBrowser {
+    fn render_updates(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = &self.updater.state;
+        div()
+            .flex().flex_col().gap_3()
+            .child(div().text_lg().child("Updates"))
+            .child(
+                Checkbox::new("automatic-update-checks")
+                    .label("Automatically check for updates")
+                    .checked(self.config.updates.automatic_check)
+                    .disabled(!self.config_ready)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.config.updates.automatic_check = !this.config.updates.automatic_check;
+                        this.worker.send(Request::Updates(this.config.updates.clone()));
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Checkbox::new("automatic-update-downloads")
+                    .label("Automatically download updates")
+                    .checked(self.config.updates.automatic_download)
+                    .disabled(!self.config_ready)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.config.updates.automatic_download = !this.config.updates.automatic_download;
+                        this.worker.send(Request::Updates(this.config.updates.clone()));
+                        cx.notify();
+                    })),
+            )
+            .child("Updates download in the background. Restart only when you choose. Downloads already in progress will finish.")
+            .child(div().text_sm().child(state.label()))
+            .when(matches!(state, crate::updater::State::Ready(..)), |view| {
+                let version = match state { crate::updater::State::Ready(_, version) => version.clone(), _ => String::new() };
+                view.child(div().text_sm().child(format!("Version {version} is ready. The running version changes after restart.")))
+            })
+            .when(matches!(state, crate::updater::State::Failed(_)), |view| {
+                let message = match state { crate::updater::State::Failed(message) => message.clone(), _ => String::new() };
+                view.child(div().text_sm().text_color(cx.theme().danger).child(message))
+            })
+            .child(
+                Button::new("check-for-updates")
+                    .ghost()
+                    .label(match state {
+                        crate::updater::State::Available(_) => "Download update",
+                        crate::updater::State::Ready(..) => "Restart to update",
+                        _ => "Check now",
+                    })
+                    .disabled(state.busy())
+                    .on_click(cx.listener(|this, _, _, cx| this.update_action(cx))),
+            )
+    }
+
     fn ensure_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_state.is_some() {
             return;
@@ -587,6 +637,11 @@ impl ClipBrowser {
             Page::Theme => self.render_theme(window, cx),
             Page::Keys => self.render_keymap(window, cx),
             Page::About => div()
+                .id("about-settings")
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_y_scroll()
                 .flex()
                 .flex_col()
                 .gap_4()
@@ -597,6 +652,7 @@ impl ClipBrowser {
                 )
                 .child("Video playback powered by embedded libmpv.")
                 .child("Built with GPUI and GPUI Kit.")
+                .child(self.render_updates(cx))
                 .child(
                     "GPUI and GPUI Kit use Apache-2.0. The decoder includes GPL/LGPL components.",
                 )

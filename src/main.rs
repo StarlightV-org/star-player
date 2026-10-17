@@ -46,6 +46,7 @@ mod theme;
 mod thumbnail_cache;
 #[cfg(all(test, windows))]
 mod todo_tests;
+mod updater;
 mod window_cursor;
 
 /// GPUI's texture upload expects BGRA, while our decoders produce RGBA.
@@ -163,7 +164,18 @@ struct PlayerShell {
 }
 
 impl PlayerShell {
-    fn render_title_bar(&self, title: &str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_title_bar(
+        &self,
+        title: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let update_visible = self.browser.read(cx).updater.state.visible();
+        let title_margin = if update_visible {
+            px(380.)
+        } else {
+            window.viewport_size().width * 0.2
+        };
         // The kit's content area excludes the window controls. Center against the
         // whole bar instead, so the filename stays at the actual window midpoint.
         div()
@@ -194,6 +206,35 @@ impl PlayerShell {
                                 }),
                         )
                         .child(div().flex_1())
+                        .when(update_visible, |bar| {
+                            let state = &self.browser.read(cx).updater.state;
+                            bar.child(
+                                div()
+                                    .occlude()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::click_overlay),
+                                    )
+                                    .child(
+                                        Button::new("title-bar-update")
+                                            .ghost()
+                                            .label(match state {
+                                                updater::State::Available(_) => {
+                                                    "Download update".into()
+                                                }
+                                                updater::State::Failed(_) => "Retry update".into(),
+                                                _ => state.label(),
+                                            })
+                                            .tooltip("Updates are managed in Settings > About")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.browser.update(cx, |browser, cx| {
+                                                    browser.update_action(cx)
+                                                });
+                                            })),
+                                    ),
+                            )
+                        })
                         .child(
                             div()
                                 .occlude()
@@ -211,20 +252,25 @@ impl PlayerShell {
                         ),
                 ),
             )
-            .when(self.path.is_some() && !self.show_settings, |bar| {
-                bar.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left(relative(0.2))
-                        .right(relative(0.2))
-                        .h(TITLE_BAR_HEIGHT)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(self.render_media_title(title, false, cx)),
-                )
-            })
+            .when(
+                self.path.is_some()
+                    && !self.show_settings
+                    && window.viewport_size().width > title_margin * 2. + px(80.),
+                |bar| {
+                    bar.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left(title_margin)
+                            .right(title_margin)
+                            .h(TITLE_BAR_HEIGHT)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(self.render_media_title(title, false, cx)),
+                    )
+                },
+            )
     }
 
     fn set_settings(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -372,13 +418,19 @@ impl PlayerShell {
                     }
                     BrowserEvent::Open => this.open(window, cx),
                     BrowserEvent::CloseSettings => this.set_settings(false, window, cx),
+                    BrowserEvent::RestartUpdate => this.restart_update(window, cx),
                     BrowserEvent::Navigate(previous) => {
                         let mut view = this.current_view(cx);
                         view.browser = previous.clone();
                         this.history.visit(view);
                     }
                     BrowserEvent::Rename(path, stem) => {
-                        if this.rename_busy {
+                        if this.rename_busy
+                            || matches!(
+                                this.browser.read(cx).updater.state,
+                                updater::State::PreparingRestart
+                            )
+                        {
                             return;
                         }
                         this.rename_busy = true;
@@ -647,6 +699,46 @@ impl PlayerShell {
             }
         }
         cx.notify();
+    }
+
+    fn restart_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename_busy {
+            return;
+        }
+        let updater::State::Ready(stage, _) = &self.browser.read(cx).updater.state else {
+            return;
+        };
+        let stage = stage.clone();
+        let reopen = self.path.clone();
+        self.browser.update(cx, |browser, cx| {
+            browser.updater.state = updater::State::PreparingRestart;
+            cx.notify();
+        });
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(
+                    async move { updater::prepare_restart(&stage, reopen.as_deref()) },
+                )
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    this.flush_audio(cx);
+                    this.save_resume(cx);
+                    this.shutdown();
+                    cx.quit();
+                }
+                Err(error) => {
+                    this.browser.update(cx, |browser, cx| {
+                        browser.updater.state = updater::State::Failed(error.clone());
+                        cx.notify();
+                    });
+                    crate::notifications::error(window, cx, "Update failed", &error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn flush_audio(&mut self, cx: &mut Context<Self>) {
@@ -1944,7 +2036,7 @@ impl Render for PlayerShell {
             .flex_col()
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| this.reveal_controls(cx)))
             .when(!window.is_fullscreen(), |shell| {
-                shell.child(self.render_title_bar(&title, cx))
+                shell.child(self.render_title_bar(&title, window, cx))
             })
             .child(div().relative().flex_1().min_h_0().child(content))
     }
@@ -2092,6 +2184,9 @@ mod styling_tests {
 }
 
 fn main() {
+    if updater::run_helper() {
+        return;
+    }
     logging::attach_parent_terminal();
     logging::Print(logging::Level::Info, "Starting StarPlayer");
     if let Err(error) = clip_store::directory() {

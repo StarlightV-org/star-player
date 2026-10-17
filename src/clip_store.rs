@@ -85,6 +85,23 @@ pub struct Config {
     pub volume: f64,
     pub muted: bool,
     pub player: PlayerConfig,
+    pub updates: UpdateConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    pub automatic_check: bool,
+    pub automatic_download: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            automatic_check: true,
+            automatic_download: true,
+        }
+    }
 }
 
 impl Default for Config {
@@ -98,6 +115,7 @@ impl Default for Config {
             volume: 100.0,
             muted: false,
             player: PlayerConfig::default(),
+            updates: UpdateConfig::default(),
         }
     }
 }

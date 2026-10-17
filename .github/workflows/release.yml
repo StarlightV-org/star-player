@@ -1,0 +1,88 @@
+name: Release portable Windows app
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      STAR_PLAYER_UPDATE_PUBLIC_KEY: ${{ vars.STAR_PLAYER_UPDATE_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.0'
+      - name: Test signing contract
+        run: bun run test:release
+      - name: Validate version and verification key
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:STAR_PLAYER_UPDATE_PUBLIC_KEY)) {
+            throw 'Set the STAR_PLAYER_UPDATE_PUBLIC_KEY repository variable first'
+          }
+          if ([Convert]::FromBase64String($env:STAR_PLAYER_UPDATE_PUBLIC_KEY).Length -ne 32) {
+            throw 'Expected a base64-encoded 32-byte Ed25519 public key'
+          }
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_NAME -ne "v$version" -or $version.Contains('-')) {
+            throw 'Tag must match the stable Cargo.toml version'
+          }
+      - name: Set up Rust
+        run: rustup update stable --no-self-update
+      - name: Test updater
+        run: |
+          cargo +stable test --locked --bin star-player updater::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +stable test --locked --bin star-player update_preferences_persist
+      - name: Build portable executable
+        run: cargo +stable build --release --locked --target x86_64-pc-windows-msvc
+      - name: Stage executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/star-player.exe dist/star-player-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: dist/star-player-windows-x86_64.exe
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-portable
+          path: dist
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.0'
+      - name: Test signing contract
+        run: bun run test:release
+      - name: Sign update metadata
+        env:
+          STAR_PLAYER_UPDATE_PUBLIC_KEY: ${{ vars.STAR_PLAYER_UPDATE_PUBLIC_KEY }}
+          STAR_PLAYER_UPDATE_PRIVATE_KEY: ${{ secrets.STAR_PLAYER_UPDATE_PRIVATE_KEY }}
+        run: bun scripts/release.ts --artifact dist/star-player-windows-x86_64.exe --version "${GITHUB_REF_NAME#v}"
+      - name: Create draft, upload all assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/star-player-windows-x86_64.exe dist/update.json dist/update.json.sig dist/SHA256SUMS
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest

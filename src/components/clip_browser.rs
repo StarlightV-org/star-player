@@ -30,6 +30,7 @@ pub enum BrowserEvent {
     Delete(Vec<PathBuf>),
     Open,
     CloseSettings,
+    RestartUpdate,
     Navigate(BrowserView),
     Rename(PathBuf, String),
     Renamed(PathBuf, PathBuf),
@@ -60,6 +61,7 @@ enum Row {
 }
 
 pub struct ClipBrowser {
+    pub updater: crate::updater::Updater,
     worker: LibraryWorker,
     icon_worker: game_icons::Worker,
     icons: game_icons::State,
@@ -148,6 +150,7 @@ impl ClipBrowser {
             icon_picker_subscription: None,
             icon_picker_observer: None,
             config: Config::default(),
+            updater: crate::updater::Updater::default(),
             catalog: Catalog::default(),
             history: History::new(),
             thumbnails: HashMap::new(),
@@ -174,6 +177,9 @@ impl ClipBrowser {
     }
 
     pub fn poll(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config_ready && self.updater.poll(&self.config.updates) {
+            cx.notify();
+        }
         for event in self.icon_worker.events().collect::<Vec<_>>() {
             match event {
                 game_icons::Event::State(state) => {
@@ -498,6 +504,15 @@ impl ClipBrowser {
     }
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn update_action(&mut self, cx: &mut Context<Self>) {
+        match &self.updater.state {
+            crate::updater::State::Ready(..) => cx.emit(BrowserEvent::RestartUpdate),
+            crate::updater::State::Available(_) => self.updater.download(),
+            _ => self.updater.check(),
+        }
+        cx.notify();
     }
     pub fn media_state(&self, path: &Path) -> crate::clip_store::MediaState {
         let mut state = crate::clip_store::media_state(&self.history, path);

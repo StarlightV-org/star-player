@@ -37,6 +37,19 @@ cargo build --release
 
 Ship `target/release/star-player.exe`; no separate decoder files need to accompany it. For builds without network access, supply the same pinned `.7z` archive using the build-time `STAR_PLAYER_MPV_ARCHIVE` environment variable. It must have the expected checksum. Cargo dependencies must also be available locally.
 
+## Updates
+
+Official Windows x86_64 releases check GitHub Releases and download newer stable
+versions in the background. Both preferences default to on and can be changed
+in **Settings > About**, which also provides a manual check. The title bar shows
+update progress and **Restart to update** when ready. Updates never restart the
+app automatically and do not require an installer. Network failures leave local
+playback available. Development builds do not check automatically.
+
+Updates require signed release metadata and a verification key embedded in the
+app. See [release setup and recovery](docs/updates.md) for the one-time GitHub
+configuration, publishing workflow, and Windows validation checklist.
+
 ## Local game clip library
 
 Launching without a file opens the clip library. On the first such launch,

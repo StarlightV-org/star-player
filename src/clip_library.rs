@@ -140,6 +140,7 @@ pub enum Request {
     Detect,
     Sort(String),
     RememberPlayback(clip_store::RememberPlayback),
+    Updates(clip_store::UpdateConfig),
     Refresh,
     Thumbnail(PathBuf, Stamp),
     Watched(Vec<PathBuf>, bool, String),
@@ -496,6 +497,24 @@ fn run(
                 Request::RememberPlayback(value) => {
                     let mut next = config.clone();
                     next.player.remember_playback = value;
+                    let result = if config_valid {
+                        clip_store::save_config(dir, &next)
+                    } else {
+                        Err("Repair config.json before saving preferences".into())
+                    };
+                    match result {
+                        Ok(()) => {
+                            config = next;
+                            let _ = events.send(Event::Config(config.clone()));
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Error(e));
+                        }
+                    }
+                }
+                Request::Updates(value) => {
+                    let mut next = config.clone();
+                    next.updates = value;
                     let result = if config_valid {
                         clip_store::save_config(dir, &next)
                     } else {
@@ -958,6 +977,41 @@ mod tests {
             b"broken"
         );
     }
+    #[test]
+    fn update_preferences_persist_without_resetting_other_settings() {
+        let store = tempfile::tempdir().unwrap();
+        let config = Config {
+            volume: 42.,
+            ..Config::default()
+        };
+        clip_store::save_config(store.path(), &config).unwrap();
+        let worker = LibraryWorker::for_test(store.path().to_owned());
+        worker.send(Request::Updates(clip_store::UpdateConfig {
+            automatic_check: false,
+            automatic_download: false,
+        }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match worker
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                Event::Config(config)
+                    if !config.updates.automatic_check && !config.updates.automatic_download =>
+                {
+                    break;
+                }
+                Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        drop(worker);
+        let saved = clip_store::read_config(store.path()).unwrap();
+        assert!(!saved.updates.automatic_check && !saved.updates.automatic_download);
+        assert_eq!(saved.volume, 42.);
+    }
+
     #[test]
     fn settings_disable_discovery_and_remove_roots_without_deleting_files() {
         let store = tempfile::tempdir().unwrap();

@@ -1,0 +1,16 @@
+{
+  "name": "spacer",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "release": "bun scripts/release.ts",
+    "test:release": "bun test scripts/release.test.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  }
+}
