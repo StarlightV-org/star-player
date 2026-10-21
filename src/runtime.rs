@@ -1,4 +1,4 @@
-//! Only the decoder embedded at build time is loaded. Nothing is found on PATH.
+//! Verified embedded playback resources. Optional exports live in export_tools.
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -50,10 +50,18 @@ fn decoder_path() -> Result<PathBuf, String> {
 }
 
 fn install_at(root: &Path, destination: &Path) -> Result<(), String> {
+    install_resources(root, destination, EMBEDDED_FILES)
+}
+
+fn install_resources(
+    root: &Path,
+    destination: &Path,
+    resources: &[EmbeddedFile],
+) -> Result<(), String> {
     if destination.exists() {
-        return verify(destination).map_err(|e| {
+        return verify_resources(destination, resources).map_err(|e| {
             format!(
-                "Bundled decoder cache is invalid: {e}. Remove {} and restart StarPlayer to restore it",
+                "Bundled media tools cache is invalid: {e}. Remove {} and restart StarPlayer to restore it",
                 destination.display()
             )
         });
@@ -64,7 +72,7 @@ fn install_at(root: &Path, destination: &Path) -> Result<(), String> {
         .prefix("extract-")
         .tempdir_in(root)
         .map_err(|e| e.to_string())?;
-    for resource in EMBEDDED_FILES {
+    for resource in resources {
         let relative = safe_relative(resource.name)?;
         let path = staging.path().join(relative);
         if let Some(parent) = path.parent() {
@@ -76,10 +84,10 @@ fn install_at(root: &Path, destination: &Path) -> Result<(), String> {
             .map_err(|e| format!("Cannot extract {}: {e}", resource.name))?;
         output.flush().map_err(|e| e.to_string())?;
     }
-    verify(staging.path())?;
+    verify_resources(staging.path(), resources)?;
     match fs::rename(staging.path(), destination) {
         Ok(()) => Ok(()),
-        Err(_) if destination.exists() => verify(destination),
+        Err(_) if destination.exists() => verify_resources(destination, resources),
         Err(error) => Err(format!("Unable to publish the bundled decoder: {error}")),
     }
 }
@@ -117,8 +125,13 @@ fn safe_relative(name: &str) -> Result<&Path, String> {
     Ok(path)
 }
 
+#[cfg(test)]
 fn verify(directory: &Path) -> Result<(), String> {
-    for resource in EMBEDDED_FILES {
+    verify_resources(directory, EMBEDDED_FILES)
+}
+
+fn verify_resources(directory: &Path, resources: &[EmbeddedFile]) -> Result<(), String> {
+    for resource in resources {
         let path = directory.join(safe_relative(resource.name)?);
         let metadata =
             fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;

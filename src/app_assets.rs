@@ -5,7 +5,17 @@ use std::borrow::Cow;
 
 icon_assets!(
     SeekIcons,
-    [RotateCcwClock, Pencil, Trash, VolumeX, Volume1, Volume2]
+    [
+        RotateCcwClock,
+        Pencil,
+        Trash,
+        VolumeX,
+        Volume1,
+        Volume2,
+        Clapperboard,
+        ArrowLeftToLine,
+        ArrowRightToLine
+    ]
 );
 
 pub struct AppAssets;
@@ -49,6 +59,9 @@ mod tests {
             "icons/volume-x.svg",
             "icons/volume-1.svg",
             "icons/volume-2.svg",
+            "icons/clapperboard.svg",
+            "icons/arrow-left-to-line.svg",
+            "icons/arrow-right-to-line.svg",
         ] {
             assert!(AppAssets.load(path).unwrap().is_some());
         }

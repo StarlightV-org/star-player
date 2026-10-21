@@ -6,6 +6,7 @@ use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
 
 pub enum SeekerEvent {
     Seek(f64),
+    Range(f64, f64),
     PreviewError(String),
 }
 
@@ -23,6 +24,8 @@ pub struct SeekerBar {
     preview_error: Option<String>,
     chapters: Vec<crate::chapters::Chapter>,
     markers: Vec<crate::chapters::Point>,
+    range: Option<(f64, f64)>,
+    range_drag: Option<bool>,
 }
 
 impl EventEmitter<SeekerEvent> for SeekerBar {}
@@ -43,6 +46,8 @@ impl SeekerBar {
             preview_error: None,
             chapters: Vec::new(),
             markers: Vec::new(),
+            range: None,
+            range_drag: None,
         }
     }
 
@@ -58,6 +63,8 @@ impl SeekerBar {
         self.duration = 0.0;
         self.chapters.clear();
         self.markers.clear();
+        self.range = None;
+        self.range_drag = None;
         cx.notify();
     }
 
@@ -96,6 +103,16 @@ impl SeekerBar {
             }
         }
         cx.notify();
+    }
+
+    pub fn set_range(&mut self, range: Option<(f64, f64)>, cx: &mut Context<Self>) {
+        if self.range != range {
+            self.range = range;
+            if range.is_none() {
+                self.range_drag = None;
+            }
+            cx.notify();
+        }
     }
 
     pub fn set_annotations(
@@ -190,6 +207,8 @@ impl Render for SeekerBar {
         let hover = self.hover;
         let segments = chapter_segments(&self.chapters, self.duration);
         let segmented = segments.len() > 1;
+        let range = self.range;
+        let owner = cx.weak_entity();
         // The transparent GPUI composition layer hosts the preview above the
         // native video. No permanently reserved thumbnail strip is needed.
         div()
@@ -215,7 +234,10 @@ impl Render for SeekerBar {
                     .cursor_pointer()
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                         this.hover_at(event.position.x, cx);
-                        if event.pressed_button == Some(MouseButton::Left) && this.duration > 0.0 {
+                        if this.range_drag.is_none()
+                            && event.pressed_button == Some(MouseButton::Left)
+                            && this.duration > 0.0
+                        {
                             cx.emit(SeekerEvent::Seek(this.pointer_time(event.position.x)));
                         }
                     }))
@@ -238,7 +260,54 @@ impl Render for SeekerBar {
                             move |area, _, _| {
                                 bounds.set(area);
                             },
-                            |_, _, _, _| {},
+                            move |_, _, window, _| {
+                                let moving = owner.clone();
+                                window.on_mouse_event(
+                                    move |event: &MouseMoveEvent, phase, _, cx| {
+                                        if phase != DispatchPhase::Capture {
+                                            return;
+                                        }
+                                        let _ = moving.update(cx, |this, cx| {
+                                            if let (Some(start_handle), Some((start, end))) =
+                                                (this.range_drag, this.range)
+                                            {
+                                                if event.pressed_button != Some(MouseButton::Left) {
+                                                    this.range_drag = None;
+                                                    return;
+                                                }
+                                                let seconds = this.pointer_time(event.position.x);
+                                                let range = if start_handle {
+                                                    (seconds.min((end - 0.001).max(0.)), end)
+                                                } else {
+                                                    (
+                                                        start,
+                                                        seconds.max(
+                                                            (start + 0.001).min(this.duration),
+                                                        ),
+                                                    )
+                                                };
+                                                this.range = Some(range);
+                                                cx.emit(SeekerEvent::Range(range.0, range.1));
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }
+                                        });
+                                    },
+                                );
+                                let releasing = owner.clone();
+                                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                                    if phase == DispatchPhase::Capture
+                                        && event.button == MouseButton::Left
+                                    {
+                                        let _ = releasing.update(cx, |this, cx| {
+                                            if this.range_drag.take().is_some() {
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }
+                                        });
+                                    }
+                                });
+                            },
                         )
                         .absolute()
                         .size_full(),
@@ -285,6 +354,17 @@ impl Render for SeekerBar {
                                     ),
                             )
                     }))
+                    .when_some(range, |bar, (start, end)| {
+                        bar.child(
+                            div()
+                                .absolute()
+                                .top(px(3.))
+                                .h(px(18.))
+                                .left(relative((start / self.duration.max(0.001)) as f32))
+                                .w(relative(((end - start) / self.duration.max(0.001)) as f32))
+                                .bg(cx.theme().primary.opacity(0.25)),
+                        )
+                    })
                     .when(self.duration > 0.0, |bar| {
                         bar.child(
                             div()
@@ -371,6 +451,31 @@ impl Render for SeekerBar {
                             )
                             .with_priority(10),
                         )
+                    })
+                    .when_some(range, |bar, (start, end)| {
+                        bar.children([(true, start), (false, end)].into_iter().enumerate().map(
+                            |(i, (start_handle, time))| {
+                                div()
+                                    .id(("clip-range-handle", i))
+                                    .absolute()
+                                    .top_0()
+                                    .h(px(24.))
+                                    .w(px(10.))
+                                    .ml(px(-5.))
+                                    .left(relative((time / self.duration.max(0.001)) as f32))
+                                    .rounded_sm()
+                                    .bg(cx.theme().primary)
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.range_drag = Some(start_handle);
+                                            this.hover = None;
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                            },
+                        ))
                     })
                     .children(
                         self.markers

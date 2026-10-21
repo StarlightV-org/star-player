@@ -78,9 +78,27 @@ the bundling code or release optimization settings.
 Required release assets:
 
 - `star-player-windows-x86_64.exe`, a standalone executable, not an installer.
+- `star-player-ffmpeg-windows-x86_64.zip`, optional FFmpeg and license notices,
+  without FFprobe or FFplay. The application does not embed this ZIP.
+- `export-package.json`, the exact package/file checksums compiled into that
+  executable. The runtime trusts the embedded manifest, not a mutable remote one.
 - `update.json`, containing version, exact target, asset name, size and SHA-256.
 - `update.json.sig`, a base64 Ed25519 signature over the exact metadata bytes.
 - `SHA256SUMS`, for manual checksum verification.
+
+Before compiling, CI runs `scripts/package-ffmpeg.ps1` to verify the pinned
+upstream archive and prepare the optional ZIP and manifest. It sets
+`STAR_PLAYER_EXPORT_MANIFEST` to the manifest path for the Cargo build and
+tests the exporter using `STAR_PLAYER_TEST_FFMPEG`. Normal local Cargo builds
+do not prepare or download FFmpeg. Local release preparation can supply the
+exact upstream `.7z` through the script's `-Archive` argument.
+
+The editor's FFmpeg download is separate from automatic application updates.
+It always requires an explicit Download action and requests the asset under
+the running version's exact `vX.Y.Z` release tag. Offline editing and playback
+remain available without FFmpeg; saving an export needs compatible local or
+previously downloaded tools. Missing assets and interrupted downloads are
+reported without falling back to another release or altering media files.
 
 Do not modify published artifacts or reuse a version tag. If publishing fails
 after draft creation, inspect and remove only that incomplete draft before

@@ -27,6 +27,7 @@ mod settings;
 
 pub enum BrowserEvent {
     Play(PathBuf, Vec<PathBuf>),
+    Edit(PathBuf, Vec<PathBuf>),
     Delete(Vec<PathBuf>),
     Open,
     CloseSettings,
@@ -894,7 +895,14 @@ impl ClipBrowser {
                         let custom_path = menu_path.clone();
                         let choose_path = menu_path.clone();
                         let restore_path = menu_path.clone();
-                        menu.item(PopupMenuItem::new("Set custom icon…").on_click(
+                        let reveal_path = menu_path.clone();
+                        menu.item(PopupMenuItem::new("Reveal in File Explorer").on_click(
+                            move |_, window, cx| {
+                                crate::file_explorer::reveal(reveal_path.clone(), window, cx)
+                            },
+                        ))
+                        .separator()
+                        .item(PopupMenuItem::new("Set custom icon…").on_click(
                             move |_, window, cx| {
                                 custom_owner.update(cx, |this, cx| {
                                     this.custom_icon(custom_path.clone(), window, cx)
@@ -1065,7 +1073,31 @@ impl ClipBrowser {
                         let rename_owner = owner.clone();
                         let delete_owner = owner.clone();
                         let rename_path = menu_path.clone();
-                        menu.when(has_unwatched, |menu| {
+                        let reveal_path = menu_path.clone();
+                        let edit_path = menu_path.clone();
+                        let edit_owner = owner.clone();
+                        menu.item(PopupMenuItem::new("Reveal in File Explorer").on_click(
+                            move |_, window, cx| {
+                                crate::file_explorer::reveal(reveal_path.clone(), window, cx)
+                            },
+                        ))
+                        .item(PopupMenuItem::new("Edit clip…").disabled(!single).on_click(
+                            move |_, _, cx| {
+                                edit_owner.update(cx, |this, cx| {
+                                    let list = this
+                                        .rows
+                                        .iter()
+                                        .filter_map(|row| match row {
+                                            Row::Clip(clip) => Some(clip.path.clone()),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    cx.emit(BrowserEvent::Edit(edit_path.clone(), list));
+                                });
+                            },
+                        ))
+                        .separator()
+                        .when(has_unwatched, |menu| {
                             menu.item(
                                 PopupMenuItem::new("Mark watched")
                                     .icon(IconName::Eye)

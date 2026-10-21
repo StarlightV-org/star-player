@@ -727,7 +727,11 @@ impl Player {
                 "Initialized software preview/test renderer"
             },
         );
-        if native {
+        if native
+            || options
+                .iter()
+                .any(|(key, value)| *key == "vo" && *value == "null")
+        {
             return Ok(player);
         }
         let api = player.api.clone();
@@ -1364,6 +1368,74 @@ impl Drop for Player {
             let _ = renderer.join();
         }
         unsafe { (self.api.destroy)(self.handle) };
+    }
+}
+
+/// Inspect a local file on the caller's worker, without a renderer, audio device,
+/// user configuration, scripts, network protocols, or the playback mix hook.
+pub(crate) fn inspect_media(
+    path: &std::path::Path,
+    stop: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    if stop.load(Ordering::Acquire) {
+        return Err("Export cancelled".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut player = Player::new_configured(
+        Arc::new(Mailbox::new()),
+        &[
+            ("vo", "null"),
+            ("ao", "null"),
+            ("sid", "no"),
+            ("demuxer", "lavf"),
+            ("demuxer-lavf-o", "protocol_whitelist=file"),
+            ("ytdl", "no"),
+            ("access-references", "no"),
+            ("autoload-files", "no"),
+            ("audio-file-auto", "no"),
+            ("sub-auto", "no"),
+            ("cover-art-auto", "no"),
+        ],
+        true,
+    )?;
+    let path = std::fs::canonicalize(path).map_err(|e| format!("Inspect media: {e}"))?;
+    player.command(&[
+        "loadfile",
+        path.to_str().ok_or("Media path is not valid UTF-8")?,
+        "replace",
+    ])?;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err("Export cancelled".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("Media inspection timed out after 15 seconds".into());
+        }
+        if !player.poll_events() {
+            return Err("Media inspector shut down".into());
+        }
+        if let Some(error) = &player.state.error {
+            return Err(error.clone());
+        }
+        if player.media_ready {
+            let tracks = player.property_node("track-list")?;
+            let video = tracks.as_array().and_then(|tracks| {
+                tracks.iter().find(|t| {
+                    t["type"] == "video" && t["albumart"] != true && t["external"] != true
+                })
+            });
+            // Read decoder parameters, not presentation parameters which can
+            // contain overrides. Wait for initialization before classifying HDR.
+            let params = player.property_node("video-dec-params").unwrap_or_default();
+            if video.is_none() || params["gamma"].is_string() {
+                return Ok(serde_json::json!({
+                    "duration": player.number("duration"),
+                    "track-list": tracks,
+                    "video-dec-params": params,
+                }));
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 

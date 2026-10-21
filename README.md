@@ -4,7 +4,7 @@ A Windows x86_64 Rust/GPUI media player with embedded libmpv GPU output.
 
 ## Self-contained Windows build
 
-The Windows x86_64 executable includes the decoder. Users do not need to install mpv, ffmpeg, codec packs, or decoder DLLs. Playback and hover thumbnails both use the embedded library. No external decoder executables are launched and no decoder libraries are searched for on `PATH`.
+The Windows x86_64 executable includes the playback decoder, not export tools. Playback, hover thumbnails, and clip inspection use embedded libmpv without external programs. FFmpeg is optional and needed only to save an export. FFprobe is not used or distributed. Users do not need codec packs or decoder DLLs.
 
 On first launch, StarPlayer creates a directory in the user's home:
 
@@ -26,6 +26,35 @@ The finished app needs no network connection for local playback or previews. It 
 ## Build and run
 
 Install Rust and the native build prerequisites for GPUI. A clean build downloads the pinned decoder archive, about 32 MB, from GitHub and verifies its SHA-256 before extraction. The build compresses runtime resources with Zstandard before embedding them in the EXE. This is a build-time download only.
+
+Normal Cargo builds do not download or embed FFmpeg. CI separately prepares
+`star-player-ffmpeg-windows-x86_64.zip` using `scripts/package-ffmpeg.ps1`.
+It contains only FFmpeg and notices from the pinned FFmpeg 9.0.2 full build,
+including dav1d for AV1 recordings. FFprobe and FFplay are excluded.
+The script creates `dist/export-package.json`; setting the build-time
+`STAR_PLAYER_EXPORT_MANIFEST` to its absolute path embeds only that small
+manifest of package and file checksums in the application.
+
+The editor checks compatible global installations using absolute `PATH`
+directories, excluding the current directory and relative/empty entries.
+It checks required codecs, filters, muxers, and command options. You can also
+choose `ffmpeg.exe` explicitly; StarPlayer remembers its path and checksum.
+If no compatible installation exists, the editor asks before downloading the
+package from the GitHub release matching the running StarPlayer version, never
+`latest`. It shows download and disk sizes, supports cancellation, and verifies
+the ZIP and each file before executing anything. No administrator access,
+global installation, or `PATH` changes are needed.
+
+Downloaded tools live under `runtime/exports/<package-sha256>`. Cached files
+are verified before use. Later exports work offline. Development builds
+without a package manifest can use a compatible local installation but cannot
+download tools. AV1 video exports explicitly use dav1d; decoding errors stop
+the export instead of publishing incomplete output.
+
+To run the optional encoder integration tests, set `STAR_PLAYER_TEST_FFMPEG`
+to a compatible absolute executable path and run
+`cargo test clip_export::tests -- --include-ignored --test-threads=1`.
+The default tests do not download FFmpeg. Inspection-only tests use libmpv.
 
 On first use, StarPlayer streams decompressed resources into the runtime cache and verifies their original size and SHA-256 before publishing the bundle. Later launches reuse the verified cache without decompression. The loaded decoder is byte-for-byte identical to the upstream DLL, so compression does not change playback or hardware acceleration. Existing valid caches remain compatible. The extracted decoder's disk size is unchanged.
 
@@ -155,6 +184,61 @@ records remain readable and migrate as corresponding paths become known. Legacy
 rows remain available for offline folders. Older content-hash records cannot be
 matched without reading media contents and are retained without reinterpretation.
 Bulk **Mark watched** and **Mark unwatched** update the same history.
+
+### Reveal and export clips
+
+Right-click a clip or folder and choose **Reveal in File Explorer**. The player's
+**File information** panel has the same action. With multiple clips selected,
+Reveal targets only the clip you right-clicked.
+
+Reveal uses Windows Shell to open the parent folder and select the requested
+clip or folder. Spaces, commas, Unicode names, and extended Windows paths do
+not pass through command-line quoting. Missing files and Shell failures appear
+as notifications instead of doing nothing.
+
+Choose **Edit clip…** from a clip's context menu or the clapperboard icon in the player toolbar. Drag the
+range handles on the timeline, enter start/end timestamps with fractional
+seconds, or use the playhead buttons inside the right edge of each input.
+During editing, percentage seeks use the selection: 0% seeks to its start,
+50% to its midpoint, and 100% to its end. Playback pauses at the selected end.
+Press Play or its hotkey there to restart from the selected start. **Preview
+range** starts the selection immediately. Chapter auto-skip is suspended while
+the editor is open. Save As always asks for a new output filename.
+
+Exports always re-encode for precise cuts rather than snapping to keyframes.
+The format dropdown offers MP4 or MKV with H.264/AAC, WebM with VP9/Opus, and
+audio-only MP3. Choose a quality preset. For MP3, High, Balanced, and
+Smaller file use 256, 192, and 128 kbps audio respectively.
+Leave the full duration selected to convert an entire file. Resolution and
+variable frame timing are retained. The current presets support SDR only;
+HDR video exports are rejected rather than silently losing their color
+information. Audio-only export is still available for HDR sources.
+Subtitles, chapters, markers, and other annotations are not exported.
+
+Select audio tracks and keep them separate or merge them into one stereo track.
+Export gains start from the player's per-track gains where stream indices are
+available. Adjust them with the same slider layout as File settings.
+Export-only changes do not alter saved player settings. Mixing has
+clipping protection. Master volume, mute, playback speed, and chapter skips do
+not affect exported media. **No audio** creates a silent video. Audio-only
+exports require at least one selected audio track. MP3 exports merge selected
+tracks into one stereo mix. Audio files do not appear in the video clip library;
+use the completion actions or **Open file** to access them.
+
+Originals are opened read-only. On Windows an export holds a read-only handle
+that also denies writes, renames, and deletion for the duration of the job.
+StarPlayer does not change source contents, file attributes, or timestamps.
+The filesystem may update access-time accounting when files are read.
+Existing output files are never replaced, including aliases of the source.
+Only a separate staging file is writable. After encoding and validation, the
+app publishes it without overwriting anything, even if another file appeared
+after the save dialog. Failure or cancellation removes the staging files and
+leaves the original untouched. Closing the app cancels the active job.
+
+Progress and cancellation stay available while browsing other clips or the
+library. Successful exports offer **Play exported clip** and **Reveal in File
+Explorer**. Exports in monitored library folders appear automatically. Saving
+elsewhere does not add a new library folder or change the current playback queue.
 
 ### Chapters and markers
 

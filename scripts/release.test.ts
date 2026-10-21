@@ -59,6 +59,27 @@ test("rejects mismatched public keys before writing metadata", async () => {
   expect(await Bun.file(join(directory, "update.json")).exists()).toBe(false);
 });
 
+test("optional FFmpeg asset receives a checksum without changing update metadata", async () => {
+  const { directory, env, command } = await fixture();
+  const tools = join(directory, "star-player-ffmpeg-windows-x86_64.zip");
+  writeFileSync(tools, "optional ffmpeg package");
+  const result = Bun.spawnSync([...command, "--export-tools", tools], { env });
+  expect(result.exitCode).toBe(0);
+  const digest = createHash("sha256").update("optional ffmpeg package").digest("hex");
+  expect(readFileSync(join(directory, "SHA256SUMS"), "utf8")).toContain(`${digest}  star-player-ffmpeg-windows-x86_64.zip\n`);
+  expect(JSON.parse(readFileSync(join(directory, "update.json"), "utf8")).asset).toBe("star-player-windows-x86_64.exe");
+});
+
+test("optional FFmpeg asset rejects an unexpected filename or empty package", async () => {
+  const { directory, env, command } = await fixture();
+  const wrong = join(directory, "ffprobe.zip");
+  writeFileSync(wrong, "wrong tools");
+  expect(Bun.spawnSync([...command, "--export-tools", wrong], { env }).stderr.toString()).toContain("Unexpected FFmpeg asset name");
+  const tools = join(directory, "star-player-ffmpeg-windows-x86_64.zip");
+  writeFileSync(tools, "");
+  expect(Bun.spawnSync([...command, "--export-tools", tools], { env }).stderr.toString()).toContain("Invalid FFmpeg package size");
+});
+
 test("rejects malformed or wrong-length private keys", async () => {
   const { env, command } = await fixture();
   for (const value of ["not base64!", Buffer.alloc(31).toString("base64"), ""]) {

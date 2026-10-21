@@ -325,8 +325,8 @@ impl TableDelegate for ThemeTable {
                 Button::new(("open-theme-file", row))
                     .ghost()
                     .label("Show file")
-                    .on_click(move |_, _, cx| {
-                        cx.reveal_path(&cx.global::<ThemeLibrary>().directory.join(&entry.file));
+                    .on_click(move |_, window, cx| {
+                        crate::file_explorer::reveal(cx.global::<ThemeLibrary>().directory.join(&entry.file), window, cx);
                     }),
             )
             .into_any_element()
@@ -841,8 +841,8 @@ impl ClipBrowser {
                             .ghost()
                             .icon(IconName::FolderOpen)
                             .label("Open themes folder")
-                            .on_click(|_, _, cx| {
-                                cx.reveal_path(&cx.global::<ThemeLibrary>().directory.clone())
+                            .on_click(|_, window, cx| {
+                                crate::file_explorer::reveal(cx.global::<ThemeLibrary>().directory.clone(), window, cx)
                             }),
                     ),
             )
@@ -1224,7 +1224,7 @@ impl ClipBrowser {
                 };
             }
             "theme_folder" if cx.has_global::<ThemeLibrary>() => {
-                cx.reveal_path(&cx.global::<ThemeLibrary>().directory.clone());
+                crate::file_explorer::reveal(cx.global::<ThemeLibrary>().directory.clone(), window, cx);
             }
             "rename_theme" => {
                 let active = cx.global::<ThemeLibrary>().active.clone();

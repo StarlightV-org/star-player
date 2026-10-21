@@ -3,6 +3,7 @@
 use components::{
     audio_tracks::{AudioTracks, TrackGainEvent},
     clip_browser::{BrowserEvent, BrowserView, ClipBrowser},
+    clip_editor::{ClipEditor, EditorEvent},
     file_settings::{FileSettingsEvent, FileSettingsPanel},
     media_controls::{MediaControls, MediaControlsEvent},
     seeker_bar::{SeekerBar, SeekerEvent},
@@ -28,9 +29,12 @@ mod app_assets;
 mod app_icon;
 mod chapters;
 mod clip_details;
+mod clip_export;
 mod clip_library;
 mod clip_store;
 mod components;
+mod export_tools;
+mod file_explorer;
 mod file_info;
 mod game_icons;
 mod keybinds;
@@ -67,6 +71,12 @@ struct NavigationView {
     queue: Vec<PathBuf>,
     folder: bool,
     browser: BrowserView,
+}
+
+struct RangePreview {
+    end: f64,
+    entered: bool,
+    requested: Instant,
 }
 
 /// Keep shortcut capture above Root's dialog layer as well as the main view.
@@ -148,6 +158,11 @@ struct PlayerShell {
     seeker_bar: Entity<SeekerBar>,
     audio_tracks: Entity<AudioTracks>,
     file_settings: Entity<FileSettingsPanel>,
+    clip_editor: Entity<ClipEditor>,
+    pending_edit: Option<PathBuf>,
+    range_preview: Option<RangePreview>,
+    edit_range: Option<(f64, f64)>,
+    segment_ended: bool,
     file_settings_trigger_bounds: Rc<Cell<Bounds<Pixels>>>,
     file_settings_panel_bounds: Rc<Cell<Bounds<Pixels>>>,
     file_settings_title_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -397,7 +412,43 @@ impl PlayerShell {
         let seeker_bar = cx.new(|cx| SeekerBar::new(0.0, cx));
         let audio_tracks = cx.new(AudioTracks::new);
         let file_settings = cx.new(|cx| FileSettingsPanel::new(audio_tracks.clone(), window, cx));
+        let clip_editor = cx.new(|cx| ClipEditor::new(window, cx));
         let subscriptions = vec![
+            cx.subscribe_in(
+                &clip_editor,
+                window,
+                |this, _, event, window, cx| match event {
+                    EditorEvent::Changed => this.sync_edit_range(cx),
+                    EditorEvent::Closed => {
+                        this.range_preview = None;
+                        this.sync_edit_range(cx);
+                        window.focus(&this.focus, cx);
+                    }
+                    EditorEvent::Preview(start, end) => {
+                        this.command(Command::SeekAbsolute(*start), cx);
+                        this.command(Command::Play, cx);
+                        this.range_preview = Some(RangePreview {
+                            end: *end,
+                            entered: false,
+                            requested: Instant::now(),
+                        });
+                    }
+                    EditorEvent::Play(path) => this.open_file(path.clone(), cx),
+                    EditorEvent::Finished(result) => {
+                        match result {
+                            Ok(path) => notifications::success(
+                                window,
+                                cx,
+                                "Clip saved",
+                                &format!("{} saved. Original unchanged.", path.display()),
+                            ),
+                            Err(error) if error == "Export cancelled" => {}
+                            Err(error) => notifications::error(window, cx, "Export failed", error),
+                        }
+                        this.sync_edit_range(cx);
+                    }
+                },
+            ),
             cx.subscribe(&file_settings, |this, _, event, cx| match event {
                 FileSettingsEvent::Save(path, settings) => {
                     this.browser.update(cx, |browser, _| {
@@ -434,6 +485,18 @@ impl PlayerShell {
                             .seeker_bar
                             .update(cx, |seeker, _| seeker.release_previews());
                         this.browser.read(cx).delete(paths.clone(), released);
+                    }
+                    BrowserEvent::Edit(path, list) => {
+                        if this.rename_busy {
+                            return;
+                        }
+                        this.remember_view(Some(path), cx);
+                        this.navigation_scan.take();
+                        this.folder_navigation = false;
+                        this.navigation = list.clone();
+                        this.load_media_at(path.clone(), 0., true, cx);
+                        this.pending_edit = Some(path.clone());
+                        window.focus(&this.focus, cx);
                     }
                     BrowserEvent::Open => this.open(window, cx),
                     BrowserEvent::CloseSettings => this.set_settings(false, window, cx),
@@ -550,9 +613,16 @@ impl PlayerShell {
                 &seeker_bar,
                 window,
                 |this, _, event: &SeekerEvent, window, cx| match event {
-                    SeekerEvent::Seek(seconds) => this.command(Command::SeekAbsolute(*seconds), cx),
+                    SeekerEvent::Seek(seconds) => {
+                        this.range_preview = None;
+                        this.command(Command::SeekAbsolute(*seconds), cx);
+                    }
                     SeekerEvent::PreviewError(error) => {
                         notifications::error(window, cx, "Preview unavailable", error)
+                    }
+                    SeekerEvent::Range(start, end) => {
+                        this.clip_editor
+                            .update(cx, |editor, cx| editor.set_range(*start, *end, window, cx));
                     }
                 },
             ),
@@ -598,6 +668,7 @@ impl PlayerShell {
             let _ = shell_entity.update(cx, |shell, cx| {
                 shell.flush_audio(cx);
                 shell.save_resume(cx);
+                shell.clip_editor.update(cx, |editor, _| editor.shutdown());
                 shell.shutdown();
             });
             true
@@ -645,6 +716,11 @@ impl PlayerShell {
             title_focus: cx.focus_handle(),
             show_tracks: false,
             file_settings,
+            clip_editor,
+            pending_edit: None,
+            range_preview: None,
+            edit_range: None,
+            segment_ended: false,
             file_settings_trigger_bounds: Rc::new(Cell::new(Bounds::default())),
             file_settings_panel_bounds: Rc::new(Cell::new(Bounds::default())),
             file_settings_title_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -666,6 +742,40 @@ impl PlayerShell {
     fn command(&mut self, command: Command, cx: &mut Context<Self>) {
         if self.rename_busy {
             return;
+        }
+        let range = self
+            .clip_editor
+            .read(cx)
+            .playback_range(self.path.as_deref(), cx);
+        let snapshot = self
+            .playback
+            .as_ref()
+            .map(|p| p.snapshot())
+            .unwrap_or_else(|| self.snapshot.clone());
+        let (command, restart) = segment_command(command, range, &snapshot, self.segment_ended);
+        if let Some((_, end)) = range {
+            match &command {
+                Command::Play => {
+                    self.segment_ended = false;
+                    self.range_preview = Some(RangePreview {
+                        end,
+                        entered: false,
+                        requested: Instant::now(),
+                    });
+                }
+                Command::Pause | Command::Stop => self.range_preview = None,
+                Command::SeekAbsolute(position) => {
+                    self.segment_ended = *position >= end - 0.001;
+                    if !snapshot.paused {
+                        self.range_preview = Some(RangePreview {
+                            end,
+                            entered: false,
+                            requested: Instant::now(),
+                        });
+                    }
+                }
+                _ => {}
+            }
         }
         match &command {
             Command::Pause | Command::Toggle if !self.snapshot.paused => self.save_resume(cx),
@@ -718,11 +828,78 @@ impl PlayerShell {
             self.reveal_controls(cx);
         }
         if let Some(player) = &self.playback {
+            if let Some(start) = restart {
+                if let Err(error) = player.send(Command::SeekAbsolute(start)) {
+                    self.error = Some(error);
+                    return;
+                }
+            }
             if let Err(error) = player.send(command) {
                 self.error = Some(error);
             }
         }
         cx.notify();
+    }
+
+    fn edit_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if self.rename_busy {
+            return;
+        }
+        self.video_click.take();
+        self.show_info = false;
+        self.show_help = false;
+        self.show_tracks = false;
+        self.focus_mode = false;
+        self.clip_editor.update(cx, |editor, cx| {
+            editor.open(path, &self.snapshot, window, cx)
+        });
+        self.sync_edit_range(cx);
+        self.reveal_controls(cx);
+        cx.notify();
+    }
+
+    fn sync_edit_range(&mut self, cx: &mut Context<Self>) {
+        let range = self.clip_editor.read(cx).range(self.path.as_deref(), cx);
+        self.seeker_bar
+            .update(cx, |seeker, cx| seeker.set_range(range, cx));
+        let playback_range = self
+            .clip_editor
+            .read(cx)
+            .playback_range(self.path.as_deref(), cx);
+        if self.edit_range != playback_range {
+            self.edit_range = playback_range;
+            self.segment_ended = false;
+            self.range_preview = None;
+            if let Some((start, end)) = playback_range {
+                if !self.snapshot.paused {
+                    if self.snapshot.position < start || self.snapshot.position > end {
+                        self.command(
+                            Command::SeekAbsolute(self.snapshot.position.clamp(start, end)),
+                            cx,
+                        );
+                    } else {
+                        self.range_preview = Some(RangePreview {
+                            end,
+                            entered: true,
+                            requested: Instant::now(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn seek_percentage(&self, fraction: f64, cx: &App) -> f64 {
+        segment_seek(
+            self.snapshot.duration,
+            self.clip_editor
+                .read(cx)
+                .playback_range(self.path.as_deref(), cx),
+            fraction,
+        )
     }
 
     fn restart_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -749,6 +926,7 @@ impl PlayerShell {
                 Ok(()) => {
                     this.flush_audio(cx);
                     this.save_resume(cx);
+                    this.clip_editor.update(cx, |editor, _| editor.shutdown());
                     this.shutdown();
                     cx.quit();
                 }
@@ -888,6 +1066,10 @@ impl PlayerShell {
         paused: bool,
         cx: &mut Context<Self>,
     ) {
+        self.pending_edit = None;
+        self.range_preview = None;
+        self.clip_editor
+            .update(cx, |editor, cx| editor.change_media(cx));
         self.save_resume(cx);
         self.resume_prompt = None;
         self.resume_candidate = None;
@@ -1035,7 +1217,12 @@ impl PlayerShell {
         if self.browser.read(cx).audio_ready()
             && let Some(path) = self.pending_load.take()
         {
+            let editing = self.pending_edit.as_ref() == Some(&path);
+            let edit_path = path.clone();
             self.load_media(path, cx);
+            if editing {
+                self.pending_edit = Some(edit_path);
+            }
         }
         if self.audio_changed.elapsed() >= Duration::from_millis(350) {
             self.flush_audio(cx);
@@ -1109,13 +1296,46 @@ impl PlayerShell {
             });
         }
         self.update_navigation_hover(window, cx);
+        if self.pending_edit.as_ref() == self.path.as_ref()
+            && self.pending_edit.is_some()
+            && self.snapshot.path == self.path
+            && self.snapshot.duration > 0.
+        {
+            self.pending_edit = None;
+            self.edit_current(window, cx);
+        }
+        self.clip_editor.update(cx, |editor, cx| {
+            editor.poll(self.path.as_deref(), self.snapshot.position, window, cx)
+        });
+        self.sync_edit_range(cx);
+        if let Some(preview) = &mut self.range_preview {
+            if !self.snapshot.paused && self.snapshot.position < preview.end {
+                preview.entered = true;
+            }
+            if (preview.entered || preview.requested.elapsed() >= Duration::from_millis(250))
+                && (self.snapshot.position >= preview.end || self.snapshot.ended)
+            {
+                let end = preview.end;
+                self.range_preview = None;
+                self.command(Command::Pause, cx);
+                self.command(Command::SeekAbsolute(end), cx);
+                self.range_preview = None;
+                self.segment_ended = true;
+            } else if !preview.entered && preview.requested.elapsed() > Duration::from_secs(5) {
+                self.range_preview = None;
+            }
+        }
         let settings = self
             .path
             .as_ref()
             .map(|path| self.browser.read(cx).media_state(path).file_settings)
             .unwrap_or_default();
         let chapters = settings.chapters(&self.snapshot.metadata, self.snapshot.duration);
-        if self.snapshot.path == self.path && self.path.is_some() && !self.snapshot.ended {
+        if self.snapshot.path == self.path
+            && self.path.is_some()
+            && !self.snapshot.ended
+            && !self.clip_editor.read(cx).visible
+        {
             if let Some(target) =
                 chapters::skip_target(&chapters, self.snapshot.position, self.snapshot.duration)
             {
@@ -1186,6 +1406,7 @@ impl PlayerShell {
                 || self.show_settings
                 || self.show_info
                 || self.show_tracks
+                || self.clip_editor.read(cx).visible
                 || self.show_help
                 || self.title_hovered
                 || self.title_focus.is_focused(window)
@@ -1307,8 +1528,8 @@ impl PlayerShell {
             "seek_forward" => Some(Command::SeekRelative(10.0)),
             "seek_back_long" => Some(Command::SeekRelative(-60.0)),
             "seek_forward_long" => Some(Command::SeekRelative(60.0)),
-            "start" => Some(Command::SeekAbsolute(0.0)),
-            "end" => Some(Command::SeekAbsolute(self.snapshot.duration)),
+            "start" => Some(Command::SeekAbsolute(self.seek_percentage(0., cx))),
+            "end" => Some(Command::SeekAbsolute(self.seek_percentage(1., cx))),
             "frame_back" => Some(Command::FrameBackStep),
             "frame_forward" => Some(Command::FrameStep),
             "mute" => Some(Command::SetMute(!self.snapshot.muted)),
@@ -1350,6 +1571,11 @@ impl PlayerShell {
                 self.show_help = false;
                 self.show_info = false;
                 self.show_tracks = false;
+                if !self.clip_editor.read(cx).busy() {
+                    self.clip_editor.update(cx, |editor, cx| editor.close(cx));
+                    self.range_preview = None;
+                    self.sync_edit_range(cx);
+                }
                 None
             }
             "help" => {
@@ -1386,7 +1612,7 @@ impl PlayerShell {
             id if id.starts_with("seek_") => id[5..]
                 .parse::<u8>()
                 .ok()
-                .map(|n| Command::SeekAbsolute(self.snapshot.duration * n as f64 / 10.0)),
+                .map(|n| Command::SeekAbsolute(self.seek_percentage(n as f64 / 10.0, cx))),
             id => {
                 self.browser
                     .update(cx, |browser, cx| browser.run_library_action(id, window, cx));
@@ -1408,6 +1634,10 @@ impl PlayerShell {
     }
 
     fn show_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_edit = None;
+        self.range_preview = None;
+        self.clip_editor
+            .update(cx, |editor, cx| editor.change_media(cx));
         self.save_resume(cx);
         self.resume_prompt = None;
         self.resume_candidate = None;
@@ -1750,6 +1980,34 @@ impl Render for PlayerShell {
                                         ),
                                 )
                                 .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .occlude()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(Self::click_overlay),
+                                        )
+                                        .child(
+                                            Button::new("edit-current-clip")
+                                                .ghost()
+                                                .icon(Icon::new(
+                                                    gpui_kit::assets::IconName::Clapperboard,
+                                                ))
+                                                .tooltip("Edit clip")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if this.clip_editor.read(cx).visible
+                                                        && !this.clip_editor.read(cx).busy()
+                                                    {
+                                                        this.clip_editor
+                                                            .update(cx, |editor, cx| {
+                                                                editor.close(cx)
+                                                            });
+                                                    } else {
+                                                        this.edit_current(window, cx);
+                                                    }
+                                                })),
+                                        ),
+                                )
                                 .child(
                                     div()
                                         .relative()
@@ -2175,7 +2433,69 @@ impl Render for PlayerShell {
             .when(!window.is_fullscreen(), |shell| {
                 shell.child(self.render_title_bar(&title, window, cx))
             })
-            .child(div().relative().flex_1().min_h_0().child(content))
+            .child(div().relative().flex_1().min_h_0().child(content).when(
+                self.clip_editor.read(cx).visible
+                    && !self.show_settings
+                    && !self.player_focus_mode(),
+                |s| {
+                    s.child(
+                        div()
+                            .id("clip-editor-panel")
+                            .absolute()
+                            .top(px(76.))
+                            .right_4()
+                            .w(px(560.))
+                            .max_w(relative(0.95))
+                            .max_h(relative(0.70))
+                            .overflow_y_scroll()
+                            .occlude()
+                            .rounded_xl()
+                            .bg(cx.theme().popover.opacity(0.98))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .shadow_lg()
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::click_overlay))
+                            .child(self.clip_editor.clone()),
+                    )
+                },
+            ))
+    }
+}
+
+fn segment_seek(duration: f64, range: Option<(f64, f64)>, fraction: f64) -> f64 {
+    let (start, end) = range.unwrap_or((0., duration));
+    start + (end - start) * fraction.clamp(0., 1.)
+}
+
+/// All play buttons, keyboard shortcuts, and media keys share this behavior.
+fn segment_command(
+    command: Command,
+    range: Option<(f64, f64)>,
+    snapshot: &Snapshot,
+    segment_ended: bool,
+) -> (Command, Option<f64>) {
+    let Some((start, end)) = range else {
+        return (command, None);
+    };
+    let at_end = segment_ended || snapshot.ended || snapshot.position >= end - 0.001;
+    match command {
+        Command::Play => (
+            Command::Play,
+            (at_end || snapshot.position < start).then_some(start),
+        ),
+        Command::Toggle if snapshot.paused || at_end => (
+            Command::Play,
+            (at_end || snapshot.position < start).then_some(start),
+        ),
+        Command::Toggle => (Command::Pause, None),
+        Command::SeekAbsolute(position) if position.is_finite() => {
+            (Command::SeekAbsolute(position.clamp(start, end)), None)
+        }
+        Command::SeekRelative(delta) if delta.is_finite() => (
+            Command::SeekAbsolute((snapshot.position + delta).clamp(start, end)),
+            None,
+        ),
+        other => (other, None),
     }
 }
 
@@ -2185,6 +2505,74 @@ fn file_settings_bottom(height: Pixels, trigger: Bounds<Pixels>) -> Pixels {
     } else {
         // The first layout has not measured the button yet. Stay on screen.
         px(60.0)
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::{Command, Snapshot, segment_command, segment_seek};
+
+    #[test]
+    fn percentages_use_the_selected_segment_and_restore_full_file_outside_editing() {
+        assert_eq!(segment_seek(100., Some((12., 28.)), 0.), 12.);
+        assert_eq!(segment_seek(100., Some((12., 28.)), 0.5), 20.);
+        assert_eq!(segment_seek(100., Some((12., 28.)), 1.), 28.);
+        assert_eq!(segment_seek(100., None, 0.), 0.);
+        assert_eq!(segment_seek(100., None, 0.5), 50.);
+    }
+
+    #[test]
+    fn play_and_hotkeys_restart_at_segment_start_after_reaching_end() {
+        let mut snapshot = Snapshot {
+            position: 28.,
+            paused: true,
+            ..Default::default()
+        };
+        for command in [Command::Play, Command::Toggle] {
+            let (command, restart) = segment_command(command, Some((12., 28.)), &snapshot, false);
+            assert!(matches!(command, Command::Play));
+            assert_eq!(restart, Some(12.));
+        }
+        // A fractional endpoint can display the preceding decoded frame.
+        snapshot.position = 27.9;
+        let (_, restart) = segment_command(Command::Toggle, Some((12., 28.)), &snapshot, true);
+        assert_eq!(restart, Some(12.));
+        snapshot.position = 20.;
+        assert_eq!(
+            segment_command(Command::Play, Some((12., 28.)), &snapshot, false).1,
+            None
+        );
+        snapshot.paused = false;
+        assert!(matches!(
+            segment_command(Command::Toggle, Some((12., 28.)), &snapshot, false).0,
+            Command::Pause
+        ));
+        assert_eq!(
+            segment_command(Command::Play, None, &snapshot, true).1,
+            None
+        );
+    }
+
+    #[test]
+    fn seeks_are_clamped_to_the_edit_range_without_changing_other_controls() {
+        let snapshot = Snapshot {
+            position: 20.,
+            ..Default::default()
+        };
+        for (command, expected) in [
+            (Command::SeekAbsolute(0.), 12.),
+            (Command::SeekAbsolute(90.), 28.),
+            (Command::SeekRelative(-60.), 12.),
+            (Command::SeekRelative(60.), 28.),
+        ] {
+            assert!(
+                matches!(segment_command(command, Some((12., 28.)), &snapshot, false).0, Command::SeekAbsolute(actual) if actual == expected)
+            );
+        }
+        assert!(matches!(
+            segment_command(Command::SetVolume(75.), Some((12., 28.)), &snapshot, false).0,
+            Command::SetVolume(75.)
+        ));
     }
 }
 

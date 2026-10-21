@@ -64,6 +64,7 @@ async function main(): Promise<void> {
     options: {
       "generate-key": { type: "boolean" },
       artifact: { type: "string" },
+      "export-tools": { type: "string" },
       version: { type: "string" },
       output: { type: "string", default: "dist" },
     },
@@ -114,7 +115,17 @@ async function main(): Promise<void> {
   await mkdir(values.output, { recursive: true });
   await writeFile(join(values.output, "update.json"), metadata);
   await writeFile(join(values.output, "update.json.sig"), signature.toString("base64"));
-  await writeFile(join(values.output, "SHA256SUMS"), `${digest}  ${asset}\n`);
+  let checksums = `${digest}  ${asset}\n`;
+  if (values["export-tools"]) {
+    const tools = values["export-tools"];
+    if (basename(tools) !== "star-player-ffmpeg-windows-x86_64.zip") throw new Error("Unexpected FFmpeg asset name");
+    const toolInfo = await stat(tools);
+    if (!toolInfo.isFile() || toolInfo.size <= 0 || toolInfo.size > 256 * 1024 * 1024) throw new Error("Invalid FFmpeg package size");
+    const toolHash = createHash("sha256");
+    for await (const chunk of createReadStream(tools)) toolHash.update(chunk);
+    checksums += `${toolHash.digest("hex")}  ${basename(tools)}\n`;
+  }
+  await writeFile(join(values.output, "SHA256SUMS"), checksums);
 }
 
 if (import.meta.main) {

@@ -17,8 +17,12 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=licenses/THIRD_PARTY_NOTICES.md");
     println!("cargo:rerun-if-env-changed=STAR_PLAYER_MPV_ARCHIVE");
+    println!("cargo:rerun-if-env-changed=STAR_PLAYER_EXPORT_MANIFEST");
     if let Err(error) = bundle() {
         panic!("Unable to embed StarPlayer's decoder: {error}");
+    }
+    if let Err(error) = export_manifest() {
+        panic!("Unable to read StarPlayer's optional export package manifest: {error}");
     }
     if let Err(error) = embed_icon() {
         panic!("Unable to embed StarPlayer's icon: {error}");
@@ -186,25 +190,57 @@ fn compress_resource(source: &Path, destination: &Path) -> Result<u64, Box<dyn E
 }
 
 fn download(destination: &Path) -> Result<(), Box<dyn Error>> {
+    download_archive(destination, ARCHIVE_URL, ARCHIVE_SHA256, MAX_DOWNLOAD)
+}
+
+fn download_archive(
+    destination: &Path,
+    url: &str,
+    expected: &str,
+    limit: u64,
+) -> Result<(), Box<dyn Error>> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(if limit > MAX_DOWNLOAD {
+            600
+        } else {
+            180
+        }))
         .build()?;
-    let mut response = client.get(ARCHIVE_URL).send()?.error_for_status()?;
+    let mut response = client.get(url).send()?.error_for_status()?;
     let partial = destination.with_extension("part");
     let mut file = fs::File::create(&partial)?;
-    let copied = std::io::copy(&mut (&mut response).take(MAX_DOWNLOAD + 1), &mut file)?;
+    let copied = std::io::copy(&mut (&mut response).take(limit + 1), &mut file)?;
     file.flush()?;
     drop(file);
-    if copied > MAX_DOWNLOAD {
+    if copied > limit {
         fs::remove_file(&partial)?;
-        return Err("decoder archive exceeds the download size limit".into());
+        return Err("media tools archive exceeds the download size limit".into());
     }
     let digest = file_digest(&partial)?;
-    if digest != ARCHIVE_SHA256 {
+    if digest != expected {
         fs::remove_file(&partial)?;
         return Err(format!("download checksum mismatch: {digest}").into());
     }
     fs::rename(partial, destination)?;
+    Ok(())
+}
+
+// CI prepares the optional release asset first. Embed its small checksum
+// manifest only, never FFmpeg's executable, ZIP, or compressed resources.
+fn export_manifest() -> Result<(), Box<dyn Error>> {
+    let output = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is missing")?);
+    let manifest = if let Some(path) = env::var_os("STAR_PLAYER_EXPORT_MANIFEST") {
+        let path = PathBuf::from(path);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let bytes = fs::read(path)?;
+        if bytes.len() > 16384 {
+            return Err("export manifest is too large".into());
+        }
+        bytes
+    } else {
+        b"null".to_vec()
+    };
+    fs::write(output.join("export_package.json"), manifest)?;
     Ok(())
 }
 

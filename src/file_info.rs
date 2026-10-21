@@ -1,5 +1,7 @@
 //! A readable media summary, not a dump of decoder internals.
 use crate::{clip_store::display_path, playback::Snapshot};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{component::ActiveTheme as _, *};
 use serde_json::Value;
 use std::path::Path;
@@ -265,6 +267,16 @@ pub fn panel(
                 .child(div().text_lg().child("File information"))
                 .child(close),
         )
+        .when_some(path.map(Path::to_owned), |panel, path| {
+            panel.child(
+                Button::new("reveal-media-file")
+                    .ghost()
+                    .label("Reveal in File Explorer")
+                    .on_click(move |_, window, cx| {
+                        crate::file_explorer::reveal(path.clone(), window, cx)
+                    }),
+            )
+        })
         .children(
             groups
                 .into_iter()
