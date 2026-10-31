@@ -56,12 +56,14 @@ impl AudioTracks {
                 let id = track.id;
                 self.subscriptions.push(cx.subscribe(
                     &slider,
-                    move |_, _, event: &SliderEvent, cx| {
+                    move |this, _, event: &SliderEvent, cx| {
                         if let SliderEvent::Change(value) = event {
-                            cx.emit(TrackGainEvent {
-                                id,
-                                gain: value.start() as f64 / 100.0,
-                            });
+                            let gain = value.start() as f64 / 100.0;
+                            if let Some(row) = this.rows.iter_mut().find(|row| row.id == id) {
+                                row.gain = gain;
+                            }
+                            cx.emit(TrackGainEvent { id, gain });
+                            cx.notify();
                         }
                     },
                 ));

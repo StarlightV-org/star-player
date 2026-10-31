@@ -1,6 +1,9 @@
 //! Bundled libmpv native GPU playback; software output is for previews and tests.
 //! Seek previews use a separate bundled mpv instance, never the playback player.
 use crate::logging::{Level, Print};
+#[path = "playback_controls.rs"]
+mod controls;
+use controls::{AudioIntent, QueuedCommand};
 use libloading::Library;
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
@@ -240,6 +243,7 @@ pub enum Command {
 
 struct Mailbox {
     snapshot: Mutex<Snapshot>,
+    audio_intent: Mutex<AudioIntent>,
     frame: Mutex<Option<VideoFrame>>,
     render_error: Mutex<Option<String>>,
     size: AtomicU64,
@@ -251,6 +255,7 @@ impl Mailbox {
     fn new() -> Self {
         Self {
             snapshot: Mutex::new(Snapshot::default()),
+            audio_intent: Mutex::new(AudioIntent::default()),
             frame: Mutex::new(None),
             render_error: Mutex::new(None),
             size: AtomicU64::new(0),
@@ -277,7 +282,7 @@ impl Mailbox {
 }
 
 pub struct Playback {
-    commands: mpsc::SyncSender<Command>,
+    commands: mpsc::SyncSender<QueuedCommand>,
     mailbox: Arc<Mailbox>,
     worker: Option<JoinHandle<()>>,
     native: bool,
@@ -338,10 +343,26 @@ impl Playback {
 
     /// Nonblocking enqueue. Execution errors appear in `Snapshot::error`.
     pub fn send(&self, command: Command) -> Result<(), String> {
-        self.commands.try_send(command).map_err(|e| match e {
-            mpsc::TrySendError::Full(_) => "Playback command queue is full".into(),
-            mpsc::TrySendError::Disconnected(_) => "Playback worker has stopped".into(),
-        })
+        controls::validate_audio(&command)?;
+        // Serialize enqueue and intent publication with worker acknowledgments.
+        let mut intent = self
+            .mailbox
+            .audio_intent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let revision = intent.revision + 1;
+        self.commands
+            .try_send(QueuedCommand {
+                revision,
+                command: command.clone(),
+            })
+            .map_err(|e| match e {
+                mpsc::TrySendError::Full(_) => "Playback command queue is full".to_owned(),
+                mpsc::TrySendError::Disconnected(_) => "Playback worker has stopped".to_owned(),
+            })?;
+        intent.revision = revision;
+        intent.record(&command);
+        Ok(())
     }
 
     /// Display dimensions in physical pixels. Zero restores source-size rendering,
@@ -359,12 +380,18 @@ impl Playback {
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        let intent = self
+            .mailbox
+            .audio_intent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut snapshot = self
             .mailbox
             .snapshot
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        intent.overlay(&mut snapshot);
         if let Some(error) = self
             .mailbox
             .render_error
@@ -393,7 +420,10 @@ impl Drop for Playback {
         // Never lose shutdown to a full queue. Keep servicing native sent
         // messages if the worker is waiting on its UI-thread parent window.
         loop {
-            match self.commands.try_send(Command::Shutdown) {
+            match self.commands.try_send(QueuedCommand {
+                revision: 0,
+                command: Command::Shutdown,
+            }) {
                 Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => break,
                 Err(mpsc::TrySendError::Full(_)) => {
                     service_native_messages(self.native);
@@ -597,8 +627,11 @@ struct Player {
     fatal_error: Option<String>,
     next_load: Option<LoadState>,
     saved_gains: std::collections::BTreeMap<i64, f64>,
+    applied_gains: std::collections::BTreeMap<i64, f64>,
+    gain_retry_since: Option<Instant>,
     resume_position: Option<f64>,
     pending_steps: std::collections::VecDeque<bool>,
+    command_revision: u64,
 }
 
 impl Player {
@@ -654,8 +687,11 @@ impl Player {
             fatal_error: None,
             next_load: None,
             saved_gains: Default::default(),
+            applied_gains: Default::default(),
+            gain_retry_since: None,
             resume_position: None,
             pending_steps: Default::default(),
+            command_revision: 0,
         };
         for (name, value) in [
             ("vo", "libmpv"),
@@ -669,6 +705,11 @@ impl Player {
             ("mute", "yes"),
             ("volume", "100"),
             ("volume-max", "100"),
+            // OpenAL otherwise queues 4 * 8192 samples, up to 740 ms. Keep
+            // device and software queues short enough for interactive mixing.
+            ("openal-num-buffers", "4"),
+            ("openal-num-samples", "1024"),
+            ("audio-buffer", "0.05"),
             // Headsets can advertise virtual 7.1 even when the listener expects
             // stereo. Downmix in mpv instead of relying on that device routing.
             ("audio-channels", "stereo"),
@@ -868,6 +909,12 @@ impl Player {
     }
 
     fn publish(&self) {
+        let mut intent = self
+            .mailbox
+            .audio_intent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        intent.acknowledge(self.command_revision);
         *self
             .mailbox
             .snapshot
@@ -992,12 +1039,59 @@ impl Player {
             .map(|t| t.id)
             .ne(self.state.tracks.iter().map(|t| t.id));
         if changed {
-            // Commit gains only after mpv accepts the new graph.
-            self.set("af", &gain_filter(&tracks)?)?;
+            // A recreated lavfi instance must start silent, never at stale or
+            // full-volume gains. Apply the requested mix as soon as it accepts
+            // commands. Only topology changes rebuild these filters.
+            let mut silent = tracks.clone();
+            for track in &mut silent {
+                track.gain = 0.0;
+            }
+            self.set("af", &gain_filter(&silent)?)?;
             self.set("lavfi-complex", &mix_graph(&tracks)?)?;
+            self.applied_gains.clear();
         }
         self.state.tracks = tracks;
         Ok(())
+    }
+
+    fn apply_track_gains(&mut self) {
+        if self.preview || !self.media_ready || self.intended_paused || self.state.tracks.is_empty()
+        {
+            self.gain_retry_since = None;
+            return;
+        }
+        for track in &self.state.tracks {
+            if self.applied_gains.get(&track.id) == Some(&track.gain) {
+                continue;
+            }
+            match self.command(&[
+                "af-command",
+                "track-gains",
+                "volume",
+                &track.gain.to_string(),
+                &format!("volume@track{}", track.id),
+            ]) {
+                Ok(()) => {
+                    self.applied_gains.insert(track.id, track.gain);
+                }
+                Err(error) => {
+                    // Filters can be absent during startup/seeking or remain
+                    // uninitialized while paused. Retain the newest request
+                    // and retry on the next event/control-worker iteration.
+                    if self.media_ready && self.frame_ready && !self.intended_paused {
+                        let since = self.gain_retry_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= Duration::from_secs(2) && self.state.error.is_none() {
+                            Print(Level::Error, &error);
+                            self.state.error = Some(format!("Apply track gains: {error}"));
+                        }
+                    } else {
+                        self.gain_retry_since = None;
+                    }
+                    return;
+                }
+            }
+        }
+        self.gain_retry_since = None;
     }
 
     fn execute(&mut self, command: Command) -> Result<(), String> {
@@ -1029,6 +1123,8 @@ impl Player {
                 self.set("lavfi-complex", "")?;
                 self.set("af", "")?;
                 self.state.tracks.clear();
+                self.applied_gains.clear();
+                self.gain_retry_since = None;
                 self.state.metadata.clear();
                 self.saved_gains = saved
                     .as_ref()
@@ -1162,35 +1258,37 @@ impl Player {
                     .iter()
                     .position(|t| t.id == id)
                     .ok_or_else(|| format!("Unknown audio track {id}"))?;
-                if self.state.tracks[index].gain == gain {
-                    return Ok(());
-                }
-                self.command(&[
-                    "af-command",
-                    "track-gains",
-                    "volume",
-                    &gain.to_string(),
-                    &format!("volume@track{id}"),
-                ])?;
                 self.state.tracks[index].gain = gain;
+                // Never replace af/lavfi-complex on a slider tick: doing so
+                // discards buffered samples and can trigger a refresh seek.
+                self.applied_gains.remove(&id);
+                self.apply_track_gains();
                 Ok(())
             }
             Command::Shutdown => Ok(()),
         }
     }
 
-    fn run(&mut self, receiver: mpsc::Receiver<Command>) {
+    fn run(&mut self, receiver: mpsc::Receiver<QueuedCommand>) {
         let mut refresh_at = Instant::now();
         let mut stats_at = Instant::now();
         loop {
             match receiver.recv_timeout(Duration::from_millis(8)) {
-                Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Ok(command) => {
-                    if let Err(error) = self.execute(command) {
-                        Print(Level::Error, &error);
-                        self.fatal_error = None;
-                        self.state.error =
-                            Some(with_diagnostic(error, self.state.diagnostic.as_deref()));
+                    let mut commands = vec![command];
+                    commands.extend(receiver.try_iter().take(127));
+                    for queued in controls::coalesce(commands) {
+                        if matches!(queued.command, Command::Shutdown) {
+                            return;
+                        }
+                        if let Err(error) = self.execute(queued.command) {
+                            Print(Level::Error, &error);
+                            self.fatal_error = None;
+                            self.state.error =
+                                Some(with_diagnostic(error, self.state.diagnostic.as_deref()));
+                        }
+                        self.command_revision = queued.revision;
                     }
                     self.refresh();
                 }
@@ -1274,6 +1372,8 @@ impl Player {
                     self.media_ready = false;
                     self.frame_ready = false;
                     self.state.tracks.clear();
+                    self.applied_gains.clear();
+                    self.gain_retry_since = None;
                     self.state.metadata.clear();
                     self.state.duration = 0.0;
                     self.state.position = 0.0;
@@ -1308,12 +1408,19 @@ impl Player {
                     }
                     self.refresh_metadata();
                 }
+                18 => {
+                    // MPV_EVENT_AUDIO_RECONFIG: live commands do not survive
+                    // filter reconstruction, even when track IDs are unchanged.
+                    self.applied_gains.clear();
+                }
                 20 => {
+                    self.applied_gains.clear();
                     self.waiting_for_seek = false;
                     self.frame_ready = false;
                     self.mailbox.invalidate_frames();
                 }
                 21 => {
+                    self.applied_gains.clear();
                     // Publish only after mpv completes startup/seek, not a redraw
                     // of the previous file or the pre-seek frame.
                     self.frame_ready = self.media_ready && !self.waiting_for_seek;
@@ -1349,6 +1456,7 @@ impl Player {
                 _ => {}
             }
         }
+        self.apply_track_gains();
         if self.intended_paused
             && self.frame_ready
             && !self.waiting_for_seek
@@ -1826,7 +1934,7 @@ fn mix_graph(tracks: &[AudioTrack]) -> Result<String, String> {
 }
 
 // Keep each stereo input separate until the commandable output filter applies
-// its gain. Changing lavfi-complex would restart playback, even for gain alone.
+// its gain. Slider edits never rebuild this filter or the input decoders.
 fn gain_filter(tracks: &[AudioTrack]) -> Result<String, String> {
     use std::fmt::Write;
     mix_graph(tracks)?;
@@ -2286,8 +2394,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0.35, 0.0]
         );
+        // The initialization graph is deliberately silent. Requested gains
+        // remain separate and are restored when audio starts or reconfigures.
         let filter = player.property_node("af").unwrap().to_string();
-        assert!(filter.contains("0.35"));
+        assert!(filter.contains(&format!("volume@track{first}=0")));
         player
             .execute(Command::LoadSaved(
                 path,
@@ -2830,6 +2940,107 @@ mod tests {
                 player.number("audio-pts")
             );
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn decoded_track_gains_survive_master_changes_and_seeks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gain-tones.avi");
+        test_fixtures::avi_timed(&path, 2, false, 64, 48, 10, 300);
+        let mut player =
+            Player::new_with_options(Arc::new(Mailbox::new()), &[("ao", "null"), ("vo", "null")])
+                .unwrap();
+        player.execute(Command::Load(path)).unwrap();
+        smoke_wait(&mut player, "decoded tones", |p| {
+            p.frame_ready && p.state.tracks.len() == 2 && p.state.position > 0.2
+        });
+        // Split the decoded mix into the fixture's two frequencies. These RMS
+        // values come from real filtered samples, not Snapshot or af options.
+        player
+            .command(&[
+                "af",
+                "add",
+                concat!(
+                    "@meter:lavfi=[asplit=2[a][b];",
+                    "[a]pan=mono|c0=c0,bandpass=f=440:t=h:w=20[a1];",
+                    "[b]pan=mono|c0=c0,bandpass=f=880:t=h:w=20[b1];",
+                    "[a1][b1]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR,",
+                    "astats=metadata=1:reset=1:measure_perchannel=RMS_level:measure_overall=none]",
+                ),
+            ])
+            .unwrap();
+        let baseline = tone_levels(&mut player);
+        let ids = [player.state.tracks[0].id, player.state.tracks[1].id];
+        for (id, gain) in ids.into_iter().zip([0.25, 0.75]) {
+            player.execute(Command::SetTrackGain { id, gain }).unwrap();
+        }
+        assert_tone_gains(&mut player, baseline, [0.25, 0.75]);
+        let graph = player.property_node("lavfi-complex").unwrap();
+        for volume in [37.0, 80.0, 100.0] {
+            player.execute(Command::SetVolume(volume)).unwrap();
+            assert_tone_gains(&mut player, baseline, [0.25, 0.75]);
+        }
+        player.command(&["ao-reload"]).unwrap();
+        assert_tone_gains(&mut player, baseline, [0.25, 0.75]);
+        for command in [Command::SeekAbsolute(3.0), Command::SeekRelative(-1.0)] {
+            player.execute(command).unwrap();
+            smoke_wait(&mut player, "gain-preserving seek", |p| p.frame_ready);
+            assert_tone_gains(&mut player, baseline, [0.25, 0.75]);
+        }
+        player.execute(Command::Pause).unwrap();
+        player.execute(Command::SeekAbsolute(5.0)).unwrap();
+        // A gain edit arriving before seek initialization must not be lost or
+        // rejected just because the live lavfi instance is unavailable.
+        player
+            .execute(Command::SetTrackGain {
+                id: ids[0],
+                gain: 0.0,
+            })
+            .unwrap();
+        smoke_wait(&mut player, "paused seek and gain", |p| p.frame_ready);
+        for command in [Command::FrameStep, Command::FrameBackStep] {
+            player.execute(command).unwrap();
+            smoke_wait(&mut player, "gain-preserving frame step", |p| p.frame_ready);
+        }
+        player.execute(Command::Play).unwrap();
+        assert_tone_gains(&mut player, baseline, [0.0, 0.75]);
+        player.execute(Command::Stop).unwrap();
+        smoke_wait(&mut player, "gain-preserving stop", |p| p.frame_ready);
+        player.execute(Command::Play).unwrap();
+        assert_tone_gains(&mut player, baseline, [0.0, 0.75]);
+        assert_eq!(player.property_node("lavfi-complex").unwrap(), graph);
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn tone_levels(player: &mut Player) -> [f64; 2] {
+        player.refresh();
+        let after = player.state.position + 0.4;
+        smoke_wait(player, "fresh measured audio", |p| {
+            p.state.position >= after
+        });
+        let metadata = player.property_node("af-metadata/meter").unwrap();
+        [1, 2].map(|channel| {
+            let db: f64 = metadata[format!("lavfi.astats.{channel}.RMS_level")]
+                .as_str()
+                .expect("Measured RMS level")
+                .parse()
+                .unwrap();
+            10.0_f64.powf(db / 20.0)
+        })
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn assert_tone_gains(player: &mut Player, baseline: [f64; 2], expected: [f64; 2]) {
+        let actual = tone_levels(player);
+        for index in 0..2 {
+            let gain = actual[index] / baseline[index];
+            assert!(
+                (gain - expected[index]).abs() < 0.04,
+                "Track {index}: measured gain {gain}, expected {}",
+                expected[index]
+            );
         }
     }
 

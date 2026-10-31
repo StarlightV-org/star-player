@@ -795,32 +795,6 @@ impl PlayerShell {
             | Command::FrameBackStep => {
                 self.resume_stopped = false;
             }
-            Command::SetVolume(volume) => {
-                self.master_volume = *volume;
-                self.pending_master = Some((*volume, self.master_muted));
-                self.audio_changed = Instant::now();
-            }
-            Command::SetMute(muted) => {
-                self.master_muted = *muted;
-                self.pending_master = Some((self.master_volume, *muted));
-                self.audio_changed = Instant::now();
-            }
-            Command::SetTrackGain { id, gain } => {
-                if let Some(path) = &self.path {
-                    let (_, gains) = self.pending_audio.get_or_insert_with(|| {
-                        (
-                            path.clone(),
-                            self.snapshot
-                                .tracks
-                                .iter()
-                                .map(|t| (t.id, t.gain))
-                                .collect(),
-                        )
-                    });
-                    gains.insert(*id, *gain);
-                    self.audio_changed = Instant::now();
-                }
-            }
             _ => {}
         }
         self.video_click.take();
@@ -834,9 +808,46 @@ impl PlayerShell {
                     return;
                 }
             }
-            if let Err(error) = player.send(command) {
+            if let Err(error) = player.send(command.clone()) {
                 self.error = Some(error);
+                return;
             }
+        }
+        // Persist only accepted requests. Also update local values immediately
+        // so repeated keyboard actions do not calculate from the last UI poll.
+        match command {
+            Command::SetVolume(volume) => {
+                self.snapshot.volume = volume;
+                self.master_volume = volume;
+                self.pending_master = Some((volume, self.master_muted));
+                self.audio_changed = Instant::now();
+            }
+            Command::SetMute(muted) => {
+                self.snapshot.muted = muted;
+                self.master_muted = muted;
+                self.pending_master = Some((self.master_volume, muted));
+                self.audio_changed = Instant::now();
+            }
+            Command::SetTrackGain { id, gain } => {
+                if let Some(track) = self.snapshot.tracks.iter_mut().find(|track| track.id == id) {
+                    track.gain = gain;
+                }
+                if let Some(path) = &self.path {
+                    let (_, gains) = self.pending_audio.get_or_insert_with(|| {
+                        (
+                            path.clone(),
+                            self.snapshot
+                                .tracks
+                                .iter()
+                                .map(|t| (t.id, t.gain))
+                                .collect(),
+                        )
+                    });
+                    gains.insert(id, gain);
+                    self.audio_changed = Instant::now();
+                }
+            }
+            _ => {}
         }
         cx.notify();
     }

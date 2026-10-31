@@ -148,6 +148,8 @@ impl Render for VolumeControls {
                 };
                 this.state
                     .update(cx, |state, cx| state.set_value(value, window, cx));
+                // set_value only updates the thumb; it does not emit Change.
+                cx.emit(VolumeEvent::Volume(value as f64));
                 cx.stop_propagation();
             }))
             .child(
@@ -155,9 +157,11 @@ impl Render for VolumeControls {
                     .ghost()
                     .icon(Icon::new(volume_icon(self.muted, volume)))
                     // .tooltip("Mute / unmute (M)")
-                    .on_click(
-                        cx.listener(|this, _, _, cx| cx.emit(VolumeEvent::Mute(!this.muted))),
-                    ),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.muted = !this.muted;
+                        cx.emit(VolumeEvent::Mute(this.muted));
+                        cx.notify();
+                    })),
             )
             .when(open, |control| {
                 control.child(
