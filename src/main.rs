@@ -12,7 +12,7 @@ use components::{
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, TITLE_BAR_HEIGHT, TitleBar, WindowExt as _,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonCustomVariant, ButtonVariants},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -2206,12 +2206,17 @@ impl Render for PlayerShell {
                                         } else {
                                             "previous-clip"
                                         })
-                                        .ghost()
+                                        .custom(
+                                            ButtonCustomVariant::new(cx)
+                                                .color(cx.theme().popover.opacity(0.70))
+                                                .foreground(cx.theme().foreground)
+                                                .hover(cx.theme().popover)
+                                                .active(cx.theme().popover),
+                                        )
                                         .w(px(196.0))
                                         .h_auto()
                                         .p_2()
                                         .rounded_lg()
-                                        .bg(cx.theme().popover)
                                         .occlude()
                                         .on_mouse_down(
                                             MouseButton::Left,
