@@ -2,12 +2,55 @@ use crate::{preview::PreviewWorker, render_image};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    cell::Cell,
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+#[derive(Default)]
+struct ScrubPosition {
+    target: Option<f64>,
+    released_at: Option<Instant>,
+}
+
+impl ScrubPosition {
+    fn update(&mut self, target: f64) {
+        self.target = Some(target);
+        self.released_at = None;
+    }
+
+    fn release(&mut self, now: Instant) {
+        if self.target.is_some() {
+            self.released_at = Some(now);
+        }
+    }
+
+    fn sync(&mut self, position: f64, now: Instant) -> f64 {
+        let Some(target) = self.target else {
+            return position;
+        };
+        if let Some(released_at) = self.released_at {
+            // Let the decoder catch up after release without snapping to an old
+            // frame. Bound the wait in case the seek fails or gets clamped.
+            if (position - target).abs() <= 0.25
+                || now.duration_since(released_at) >= Duration::from_secs(1)
+            {
+                *self = Self::default();
+                return position;
+            }
+        }
+        target
+    }
+}
 
 pub enum SeekerEvent {
     Seek(f64),
     Range(f64, f64),
     PreviewError(String),
+    InteractionChanged,
 }
 
 pub struct SeekerBar {
@@ -26,6 +69,9 @@ pub struct SeekerBar {
     markers: Vec<crate::chapters::Point>,
     range: Option<(f64, f64)>,
     range_drag: Option<bool>,
+    hovered: bool,
+    dragging: bool,
+    scrub: ScrubPosition,
 }
 
 impl EventEmitter<SeekerEvent> for SeekerBar {}
@@ -48,6 +94,9 @@ impl SeekerBar {
             markers: Vec::new(),
             range: None,
             range_drag: None,
+            hovered: false,
+            dragging: false,
+            scrub: ScrubPosition::default(),
         }
     }
 
@@ -65,6 +114,8 @@ impl SeekerBar {
         self.markers.clear();
         self.range = None;
         self.range_drag = None;
+        self.dragging = false;
+        self.scrub = ScrubPosition::default();
         cx.notify();
     }
 
@@ -82,7 +133,7 @@ impl SeekerBar {
     }
 
     pub fn sync(&mut self, position: f64, duration: f64, cx: &mut Context<Self>) {
-        self.position = position;
+        self.position = self.scrub.sync(position, Instant::now());
         self.duration = duration;
         if let Some(frame) = self.previews.take() {
             if frame.generation == self.generation {
@@ -128,6 +179,10 @@ impl SeekerBar {
         }
     }
 
+    pub fn interacting(&self) -> bool {
+        self.hovered || self.dragging || self.range_drag.is_some()
+    }
+
     fn pointer_time(&self, x: Pixels) -> f64 {
         let bounds = self.bounds.get();
         hover_time(
@@ -135,6 +190,14 @@ impl SeekerBar {
             f32::from(bounds.size.width),
             self.duration,
         )
+    }
+
+    fn scrub_at(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let seconds = self.pointer_time(x);
+        self.scrub.update(seconds);
+        self.position = seconds;
+        cx.emit(SeekerEvent::Seek(seconds));
+        cx.notify();
     }
 
     fn hover_at(&mut self, x: Pixels, cx: &mut Context<Self>) {
@@ -212,12 +275,18 @@ impl Render for SeekerBar {
         // The transparent GPUI composition layer hosts the preview above the
         // native video. No permanently reserved thumbnail strip is needed.
         div()
+            .id("seeker-bar")
             .flex()
             .w_full()
             .min_w_0()
             .items_center()
             .h(px(24.0))
             .gap_2()
+            .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
+                this.hovered = *hovering;
+                cx.emit(SeekerEvent::InteractionChanged);
+                cx.notify();
+            }))
             .child(
                 div()
                     .flex_shrink_0()
@@ -234,18 +303,14 @@ impl Render for SeekerBar {
                     .cursor_pointer()
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                         this.hover_at(event.position.x, cx);
-                        if this.range_drag.is_none()
-                            && event.pressed_button == Some(MouseButton::Left)
-                            && this.duration > 0.0
-                        {
-                            cx.emit(SeekerEvent::Seek(this.pointer_time(event.position.x)));
-                        }
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
                             if this.duration > 0.0 {
-                                cx.emit(SeekerEvent::Seek(this.pointer_time(event.position.x)));
+                                this.dragging = true;
+                                cx.emit(SeekerEvent::InteractionChanged);
+                                this.scrub_at(event.position.x, cx);
                             }
                         }),
                     )
@@ -268,13 +333,22 @@ impl Render for SeekerBar {
                                             return;
                                         }
                                         let _ = moving.update(cx, |this, cx| {
+                                            if event.pressed_button != Some(MouseButton::Left) {
+                                                if this.dragging || this.range_drag.is_some() {
+                                                    this.scrub.release(Instant::now());
+                                                    this.dragging = false;
+                                                    this.range_drag = None;
+                                                    cx.emit(SeekerEvent::InteractionChanged);
+                                                    cx.notify();
+                                                }
+                                                return;
+                                            }
+                                            if this.dragging && this.duration > 0.0 {
+                                                this.scrub_at(event.position.x, cx);
+                                            }
                                             if let (Some(start_handle), Some((start, end))) =
                                                 (this.range_drag, this.range)
                                             {
-                                                if event.pressed_button != Some(MouseButton::Left) {
-                                                    this.range_drag = None;
-                                                    return;
-                                                }
                                                 let seconds = this.pointer_time(event.position.x);
                                                 let range = if start_handle {
                                                     (seconds.min((end - 0.001).max(0.)), end)
@@ -300,8 +374,11 @@ impl Render for SeekerBar {
                                         && event.button == MouseButton::Left
                                     {
                                         let _ = releasing.update(cx, |this, cx| {
-                                            if this.range_drag.take().is_some() {
-                                                cx.stop_propagation();
+                                            let range_dragging = this.range_drag.take().is_some();
+                                            if this.dragging || range_dragging {
+                                                this.scrub.release(Instant::now());
+                                                this.dragging = false;
+                                                cx.emit(SeekerEvent::InteractionChanged);
                                                 cx.notify();
                                             }
                                         });
@@ -470,7 +547,10 @@ impl Render for SeekerBar {
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
                                             this.range_drag = Some(start_handle);
+                                            this.dragging = false;
+                                            this.scrub = ScrubPosition::default();
                                             this.hover = None;
+                                            cx.emit(SeekerEvent::InteractionChanged);
                                             cx.stop_propagation();
                                         }),
                                     )
@@ -514,7 +594,49 @@ impl Render for SeekerBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{chapter_segments, hover_time, timestamp};
+    use super::{ScrubPosition, chapter_segments, hover_time, timestamp};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn dragging_follows_latest_pointer_instead_of_playback_snapshots() {
+        let now = Instant::now();
+        let mut scrub = ScrubPosition::default();
+        scrub.update(120.0);
+        assert_eq!(scrub.sync(30.0, now), 120.0);
+        assert_eq!(scrub.sync(120.0, now), 120.0);
+        scrub.update(90.0);
+        assert_eq!(scrub.sync(121.0, now + Duration::from_secs(5)), 90.0);
+    }
+
+    #[test]
+    fn release_holds_target_until_playback_catches_up() {
+        let now = Instant::now();
+        let mut scrub = ScrubPosition::default();
+        scrub.update(120.0);
+        scrub.release(now);
+        assert_eq!(scrub.sync(30.0, now + Duration::from_millis(100)), 120.0);
+        assert_eq!(scrub.sync(120.1, now + Duration::from_millis(200)), 120.1);
+        assert_eq!(scrub.sync(121.0, now + Duration::from_millis(300)), 121.0);
+    }
+
+    #[test]
+    fn failed_seek_does_not_pin_the_seeker_forever() {
+        let now = Instant::now();
+        let mut scrub = ScrubPosition::default();
+        scrub.update(120.0);
+        scrub.release(now);
+        assert_eq!(scrub.sync(30.0, now + Duration::from_secs(1)), 30.0);
+    }
+
+    #[test]
+    fn starting_another_drag_discards_the_previous_release_deadline() {
+        let now = Instant::now();
+        let mut scrub = ScrubPosition::default();
+        scrub.update(120.0);
+        scrub.release(now);
+        scrub.update(60.0);
+        assert_eq!(scrub.sync(120.0, now + Duration::from_secs(2)), 60.0);
+    }
 
     #[test]
     fn chapter_segments_cover_the_video_and_ignore_hidden_duplicates() {

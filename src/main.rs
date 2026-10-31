@@ -613,6 +613,10 @@ impl PlayerShell {
                 &seeker_bar,
                 window,
                 |this, _, event: &SeekerEvent, window, cx| match event {
+                    SeekerEvent::InteractionChanged => {
+                        this.controls_dragging = false;
+                        this.reveal_controls(cx);
+                    }
                     SeekerEvent::Seek(seconds) => {
                         this.range_preview = None;
                         this.command(Command::SeekAbsolute(*seconds), cx);
@@ -1423,6 +1427,7 @@ impl PlayerShell {
                 || self.title_focus.is_focused(window)
                 || self.rename_busy
                 || self.volume_controls.read(cx).interacting(window, cx)
+                || self.seeker_bar.read(cx).interacting()
                 || self.hover_navigation.is_some()
                 || self.snapshot.error.is_some(),
             self.controls_dragging,
