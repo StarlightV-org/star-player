@@ -180,7 +180,8 @@ struct PlayerShell {
     controls_frame: Instant,
     controls_dragging: bool,
     last_activity: Instant,
-    video_click: Option<Task<()>>,
+    // Playback state before the first click, restored if a second click follows.
+    video_click: Option<bool>,
     media_keys: media_keys::MediaKeys,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
@@ -1036,26 +1037,35 @@ impl PlayerShell {
     fn click_video(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
         self.reveal_controls(cx);
-        self.video_click.take();
-        if event.click_count == 2 {
-            window.zoom_window();
-        } else if event.click_count == 1 && self.path.is_some() {
-            // Wait out the OS double-click interval. Maximizing must not also
-            // toggle playback on the first click of the pair.
-            self.video_click = Some(cx.spawn_in(window, async move |this, cx| {
-                cx.background_executor()
-                    .timer(double_click_interval())
-                    .await;
-                let _ = this.update_in(cx, |this, _, cx| this.command(Command::Toggle, cx));
-            }));
+        let paused_before = self.video_click.take();
+        if event.click_count > 0 && event.click_count % 2 == 0 {
+            // The first click acts immediately. Undo only that click's playback
+            // change so a double-click leaves playback as it was.
+            if let Some(paused) = paused_before {
+                self.command(
+                    if paused {
+                        Command::Pause
+                    } else {
+                        Command::Play
+                    },
+                    cx,
+                );
+            }
+            window.toggle_fullscreen();
+        } else if event.click_count % 2 == 1 && self.path.is_some() {
+            let paused = self
+                .playback
+                .as_ref()
+                .map_or(self.snapshot.paused, |player| player.snapshot().paused);
+            self.command(Command::Toggle, cx);
+            self.video_click = Some(paused);
         }
         cx.stop_propagation();
     }
 
     fn click_overlay(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // A previous background click may still be waiting for the double-click
-        // interval. Interacting with a panel cancels it as well as blocking any
-        // new click from reaching the video sibling behind this panel.
+        // Panel clicks must not complete a background double-click or reach the
+        // video sibling behind this panel.
         self.video_click.take();
         self.reveal_controls(cx);
         cx.stop_propagation();
@@ -2651,6 +2661,7 @@ fn controls_should_show(
     !focus_mode && (persistent || interacting || idle < Duration::from_millis(1500))
 }
 
+#[cfg(all(test, windows))]
 fn double_click_interval() -> Duration {
     #[cfg(windows)]
     return Duration::from_millis(u64::from(unsafe {
@@ -3031,6 +3042,113 @@ mod overlay_tests {
             "Empty markers must not scroll, and the marker tab must open"
         );
         assert!(closed, "Toolbar must toggle the panel closed");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "interactive GPUI video gestures and fullscreen transitions"]
+    fn video_click_is_immediate_and_double_click_toggles_fullscreen_both_ways() {
+        use gpui_kit::{
+            MouseButton, MouseDownEvent, MouseUpEvent, WindowOptions, application, init, point, px,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clicks.avi");
+        crate::playback::test_fixtures::avi_timed(&path, 0, false, 64, 48, 30, 300);
+        let result = Arc::new(Mutex::new(None));
+        let report = result.clone();
+        application()
+            .with_assets(app_assets::AppAssets)
+            .run(move |cx| {
+                init(cx);
+                theme::apply(cx);
+                let mut player = None;
+                let handle = cx
+                    .open_window(WindowOptions::default(), |window, cx| {
+                        let entity = cx.new(|cx| {
+                            let mut shell = PlayerShell::new(window, cx);
+                            shell.command(Command::SetMute(true), cx);
+                            shell.load_media_at(path, 0.0, true, cx);
+                            shell
+                        });
+                        player = Some(entity.clone());
+                        cx.new(|cx| gpui_kit::base::Root::new(entity, window, cx))
+                    })
+                    .unwrap();
+                let player = player.unwrap();
+                cx.spawn(async move |cx| {
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                    let mut checks = Vec::new();
+                    handle
+                        .update(cx, |_, _, cx| {
+                            player.update(cx, |shell, cx| shell.command(Command::Pause, cx));
+                        })
+                        .unwrap();
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    // Two pairs also cover GPUI's continuing click counts 3/4.
+                    for click_count in 1..=4 {
+                        handle
+                            .update(cx, |_, window, cx| {
+                                let size = window.viewport_size();
+                                let position =
+                                    point(size.width / 2.0, size.height / 2.0 - px(40.0));
+                                window.dispatch_event(
+                                    MouseDownEvent {
+                                        position,
+                                        button: MouseButton::Left,
+                                        click_count,
+                                        ..Default::default()
+                                    }
+                                    .to_platform_input(),
+                                    cx,
+                                );
+                                window.dispatch_event(
+                                    MouseUpEvent {
+                                        position,
+                                        button: MouseButton::Left,
+                                        ..Default::default()
+                                    }
+                                    .to_platform_input(),
+                                    cx,
+                                );
+                            })
+                            .unwrap();
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                        checks.push(
+                            handle
+                                .update(cx, |_, window, cx| {
+                                    let shell = player.read(cx);
+                                    let state = shell.playback.as_ref().unwrap().snapshot();
+                                    (state.paused, window.is_fullscreen(), state.error.clone())
+                                })
+                                .unwrap(),
+                        );
+                    }
+                    handle
+                        .update(cx, |_, _, cx| {
+                            *report.lock().unwrap() = Some(checks);
+                            player.update(cx, |shell, _| shell.shutdown());
+                            cx.quit();
+                        })
+                        .unwrap();
+                })
+                .detach();
+                cx.activate(true);
+            });
+        let checks = result.lock().unwrap().take().expect("UI check completed");
+        assert_eq!(
+            checks,
+            vec![
+                (false, false, None),
+                (true, true, None),
+                (false, true, None),
+                (true, false, None),
+            ],
+            "Single clicks must act within 100ms; double-clicks must restore pause state and toggle fullscreen"
+        );
     }
 
     #[test]
